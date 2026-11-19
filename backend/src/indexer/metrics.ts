@@ -44,6 +44,11 @@ export const indexerEventsProcessedTotal = define("indexer_events_processed_tota
 export const indexerErrorsTotal = define("indexer_errors_total", "Indexer errors.", "counter");
 export const indexerUnmappedEventsTotal = define("indexer_unmapped_events_total", "Contract events with no handler.", "counter");
 
+export const ipredictTotalSupply = define("ipredict_total_supply", "Total minted IPREDICT tokens.", "gauge");
+export const ipredictSupplyCap = define("ipredict_supply_cap", "Maximum supply cap for IPREDICT token.", "gauge");
+export const ipredictCirculatingSupply = define("ipredict_circulating_supply", "Circulating supply of IPREDICT tokens.", "gauge");
+export const ipredictRewardsDistributedTotal = define("ipredict_rewards_distributed_total", "Cumulative reward tokens distributed.", "counter");
+
 /** Sets a gauge to `value` for the given labels. */
 export function setGauge(def: MetricDef, value: number, labels: Labels = {}): void {
   def.series.set(labelKey(labels), { labels, value });
