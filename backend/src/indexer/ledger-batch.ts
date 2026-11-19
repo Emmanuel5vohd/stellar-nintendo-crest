@@ -22,8 +22,31 @@ export interface BatchStore {
 }
 
 /**
+ * Tables that are declaratively partitioned by a timestamp column (#252). Writes to these tables
+ * must target the parent table so PostgreSQL routes each row to its quarterly partition; the
+ * application never names a partition directly.
+ */
+export const PARTITIONED_TABLES: Readonly<Record<string, string>> = {
+  bets: 'placed_at',
+};
+
+/**
+ * Returns the quarterly partition name for a timestamp, e.g. `bets_2026_q1`. Mirrors the
+ * `bets_<year>_q<quarter>` naming used by the partition management routine so the indexer and the
+ * provisioning routine agree on boundaries.
+ */
+export function quarterlyPartitionName(table: string, at: Date): string {
+  const year = at.getUTCFullYear();
+  const quarter = Math.floor(at.getUTCMonth() / 3) + 1;
+  return `${table}_${year}_q${quarter}`;
+}
+
+/**
  * Writes every event of one ledger in a single transaction. Rows are grouped per table, so each
  * table gets one multi-row statement instead of one statement per event.
+ *
+ * Partitioned tables are written through their parent table, so partitioning stays transparent to
+ * callers and no query changes are required.
  */
 export async function flushLedgerBatch(store: BatchStore, writes: LedgerWrite[]): Promise<void> {
   if (writes.length === 0) return;

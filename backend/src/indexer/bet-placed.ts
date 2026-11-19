@@ -5,6 +5,12 @@
  * single transaction, and is idempotent on `(tx_hash, event_index)` so a replayed event is
  * applied once. The store is an interface so the handler runs against PostgreSQL in the indexer
  * and against an in-memory store in tests.
+ *
+ * The `bets` table is declaratively partitioned by `placed_at` on calendar-quarter RANGE
+ * boundaries (#252). Partitioning is transparent to this handler: inserts route to the correct
+ * quarterly partition automatically and reads against `bets` are unchanged. The helpers below
+ * derive the quarter boundaries used by the partition-management routine so the indexer and the
+ * migration/runbook agree on the same calendar-quarter scheme.
  */
 
 export interface BetPlacedEvent {
@@ -46,6 +52,50 @@ export interface BetStoreTx {
   insertBet(row: BetRow): Promise<void>;
   getMarketTotals(marketId: number): Promise<MarketTotals | undefined>;
   setMarketTotals(totals: MarketTotals): Promise<void>;
+}
+
+/**
+ * Calendar-quarter partition descriptor for the `bets` table (#252).
+ *
+ * `name` is the child partition table name (e.g. `bets_2026_q1`) and `[start, end)` is the
+ * half-open `placed_at` range it covers, matching PostgreSQL RANGE partition bounds.
+ */
+export interface BetPartition {
+  name: string;
+  start: Date;
+  end: Date;
+}
+
+/**
+ * Returns the calendar-quarter partition that covers `date`.
+ *
+ * Quarters are calendar-aligned: Q1 = Jan–Mar, Q2 = Apr–Jun, Q3 = Jul–Sep, Q4 = Oct–Dec. The
+ * returned range is half-open (`start` inclusive, `end` exclusive) so adjacent partitions never
+ * overlap, which is required for PostgreSQL RANGE partitioning.
+ */
+export function betPartitionFor(date: Date): BetPartition {
+  const year = date.getUTCFullYear();
+  const quarter = Math.floor(date.getUTCMonth() / 3) + 1;
+  const startMonth = (quarter - 1) * 3;
+  const start = new Date(Date.UTC(year, startMonth, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(year, startMonth + 3, 1, 0, 0, 0, 0));
+  return { name: `bets_${year}_q${quarter}`, start, end };
+}
+
+/**
+ * Returns the next `count` calendar-quarter partitions starting at the quarter containing
+ * `from`. Used by the partition-management routine to pre-provision upcoming quarters so inserts
+ * never fail on a missing partition.
+ */
+export function upcomingBetPartitions(from: Date, count: number): BetPartition[] {
+  const partitions: BetPartition[] = [];
+  let cursor = betPartitionFor(from).start;
+  for (let i = 0; i < count; i += 1) {
+    const partition = betPartitionFor(cursor);
+    partitions.push(partition);
+    cursor = partition.end;
+  }
+  return partitions;
 }
 
 /**
