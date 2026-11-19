@@ -64,6 +64,106 @@ function sendError(res, status, code, message, details) {
 }
 
 // ---------------------------------------------------------------------------
+// Health / readiness probes (issue #245)
+// ---------------------------------------------------------------------------
+
+const HEALTH_TIMEOUT_MS = Number(process.env.HEALTH_TIMEOUT_MS) || 2000;
+
+// Wrap a dependency check so it can never hang the probe: resolves to a
+// structured status object within HEALTH_TIMEOUT_MS.
+function withTimeout(name, checkFn) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const startedAt = Date.now();
+    const finish = (status, extra) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({
+        name,
+        status,
+        latencyMs: Date.now() - startedAt,
+        ...(extra || {}),
+      });
+    };
+
+    const timer = setTimeout(() => {
+      finish('down', { error: `timeout after ${HEALTH_TIMEOUT_MS}ms` });
+    }, HEALTH_TIMEOUT_MS);
+
+    Promise.resolve()
+      .then(() => checkFn())
+      .then((extra) => finish('up', extra))
+      .catch((err) => finish('down', { error: err && err.message ? err.message : String(err) }));
+  });
+}
+
+// PostgreSQL ping. Uses a pluggable `dbPing` handler registered on the app so
+// the concrete pool/query can be wired in without coupling this module.
+async function checkPostgres() {
+  const ping = app.get('dbPing');
+  if (typeof ping !== 'function') {
+    throw new Error('dbPing handler not configured');
+  }
+  await ping();
+  return {};
+}
+
+// Redis ping. Uses a pluggable `redisPing` handler registered on the app.
+async function checkRedis() {
+  const ping = app.get('redisPing');
+  if (typeof ping !== 'function') {
+    throw new Error('redisPing handler not configured');
+  }
+  await ping();
+  return {};
+}
+
+// Soroban RPC block height. Uses a pluggable `sorobanBlockHeight` handler.
+async function checkSoroban() {
+  const getHeight = app.get('sorobanBlockHeight');
+  if (typeof getHeight !== 'function') {
+    throw new Error('sorobanBlockHeight handler not configured');
+  }
+  const blockHeight = await getHeight();
+  return { blockHeight };
+}
+
+// Liveness: cheap, no dependency queries. Must respond in sub-10ms.
+app.get('/health/liveness', (req, res) => {
+  return res.status(200).json({
+    status: 'alive',
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.round(process.uptime()),
+  });
+});
+
+// Readiness: checks PostgreSQL, Redis, and Soroban RPC. Returns 200 only when
+// every subsystem is up; 503 otherwise.
+app.get('/health/readiness', async (req, res) => {
+  const checks = await Promise.all([
+    withTimeout('postgres', checkPostgres),
+    withTimeout('redis', checkRedis),
+    withTimeout('soroban', checkSoroban),
+  ]);
+
+  const subsystems = {};
+  let healthy = true;
+  for (const check of checks) {
+    subsystems[check.name] = check;
+    if (check.status !== 'up') {
+      healthy = false;
+    }
+  }
+
+  return res.status(healthy ? 200 : 503).json({
+    status: healthy ? 'ready' : 'not_ready',
+    timestamp: new Date().toISOString(),
+    subsystems,
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Admin RBAC + audit log (issue #244)
 // ---------------------------------------------------------------------------
 
@@ -266,35 +366,7 @@ app.get(
 
 // 404 handler: unmatched routes conform to the uniform envelope.
 app.use((req, res) => {
-  return sendError(res, 404, 'NOT_FOUND', 'Resource not found', { path: req.originalUrl });
-});
-
-// Centralized error handler mapping domain/validation/unknown errors to the envelope.
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, next) => {
-  if (res.headersSent) {
-    return next(err);
-  }
-
-  // Body parser / validation errors carry a 4xx status and a type.
-  if (err && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large')) {
-    const status = err.status || err.statusCode || 400;
-    const code = err.type === 'entity.too.large' ? 'PAYLOAD_TOO_LARGE' : 'INVALID_JSON';
-    return sendError(res, status, code, err.message || 'Invalid request body');
-  }
-
-  const status = err && (err.status || err.statusCode);
-  if (status && status >= 400 && status < 500) {
-    const code = (err && err.code) || 'BAD_REQUEST';
-    const details = err && err.details;
-    return sendError(res, status, code, (err && err.message) || 'Bad request', details);
-  }
-
-  // Unknown / server errors: log with a tracking ID for correlation.
-  const trackingId = crypto.randomUUID();
-  // eslint-disable-next-line no-console
-  console.error(`[error] trackingId=${trackingId}`, err);
-  return sendError(res, 500, 'INTERNAL_SERVER_ERROR', 'Internal server error', { trackingId });
+  return sendError(res, 404, 'NOT_FOUND', 'Resource not found');
 });
 
 module.exports = app;

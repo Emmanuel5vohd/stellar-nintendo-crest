@@ -207,6 +207,151 @@ function requireAdminRole(allowedRoles) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Health / readiness probes for orchestration (Kubernetes, Docker)
+// ---------------------------------------------------------------------------
+
+const HEALTH_TIMEOUT_MS = Number(process.env.HEALTH_CHECK_TIMEOUT_MS) || 2000;
+
+// Wraps a dependency check with a timeout so a hung dependency cannot stall
+// the probe. Resolves to a normalized { status, latencyMs, ... } report.
+async function runHealthCheck(name, checkFn) {
+  const startedAt = process.hrtime.bigint();
+  let timer;
+  try {
+    const result = await Promise.race([
+      Promise.resolve().then(checkFn),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`Timed out after ${HEALTH_TIMEOUT_MS}ms`)),
+          HEALTH_TIMEOUT_MS
+        );
+      }),
+    ]);
+    const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    return { name, status: 'up', latencyMs: Math.round(latencyMs * 100) / 100, ...(result || {}) };
+  } catch (err) {
+    const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    return {
+      name,
+      status: 'down',
+      latencyMs: Math.round(latencyMs * 100) / 100,
+      error: err && err.message ? err.message : String(err),
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// PostgreSQL ping. Uses `pg` when available; otherwise reports the dependency
+// as unconfigured so the probe still returns a structured report.
+async function checkPostgres() {
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    return { status: 'down', error: 'DATABASE_URL is not configured' };
+  }
+  let pg;
+  try {
+    // eslint-disable-next-line global-require
+    pg = require('pg');
+  } catch (err) {
+    return { status: 'down', error: 'pg driver is not installed' };
+  }
+  const client = new pg.Client({ connectionString, connectionTimeoutMillis: HEALTH_TIMEOUT_MS });
+  try {
+    await client.connect();
+    await client.query('SELECT 1');
+    return { status: 'up' };
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+// Redis ping. Uses `redis` when available; otherwise reports unconfigured.
+async function checkRedis() {
+  const redisUrl = process.env.REDIS_URL;
+  if (!redisUrl) {
+    return { status: 'down', error: 'REDIS_URL is not configured' };
+  }
+  let redis;
+  try {
+    // eslint-disable-next-line global-require
+    redis = require('redis');
+  } catch (err) {
+    return { status: 'down', error: 'redis driver is not installed' };
+  }
+  const client = redis.createClient({ url: redisUrl });
+  client.on('error', () => {});
+  try {
+    await client.connect();
+    const pong = await client.ping();
+    return { status: pong === 'PONG' ? 'up' : 'down', detail: pong };
+  } finally {
+    await client.quit().catch(() => {});
+  }
+}
+
+// Soroban RPC block height. Queries the RPC `getLatestLedger` method.
+async function checkSorobanRpc() {
+  const rpcUrl = process.env.SOROBAN_RPC_URL;
+  if (!rpcUrl) {
+    return { status: 'down', error: 'SOROBAN_RPC_URL is not configured' };
+  }
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
+  try {
+    const response = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLatestLedger', params: {} }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return { status: 'down', error: `RPC responded with HTTP ${response.status}` };
+    }
+    const payload = await response.json();
+    if (payload && payload.error) {
+      return { status: 'down', error: payload.error.message || 'RPC error' };
+    }
+    const blockHeight = payload && payload.result ? payload.result.sequence : undefined;
+    if (blockHeight === undefined) {
+      return { status: 'down', error: 'RPC response missing ledger sequence' };
+    }
+    return { status: 'up', blockHeight };
+  } finally {
+    clearTimeout(abortTimer);
+  }
+}
+
+// Liveness: cheap, no dependency queries. Must respond in sub-10ms.
+app.get('/health/liveness', (req, res) => {
+  res.status(200).json({ status: 'ok', uptimeSeconds: Math.round(process.uptime()) });
+});
+
+// Readiness: verifies all downstream dependencies within the timeout window.
+app.get('/health/readiness', async (req, res) => {
+  const checks = await Promise.all([
+    runHealthCheck('postgres', checkPostgres),
+    runHealthCheck('redis', checkRedis),
+    runHealthCheck('sorobanRpc', checkSorobanRpc),
+  ]);
+
+  const subsystems = {};
+  let healthy = true;
+  checks.forEach((check) => {
+    subsystems[check.name] = check;
+    if (check.status !== 'up') {
+      healthy = false;
+    }
+  });
+
+  return res.status(healthy ? 200 : 503).json({
+    status: healthy ? 'ready' : 'not_ready',
+    timestamp: new Date().toISOString(),
+    subsystems,
+  });
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
@@ -245,80 +390,6 @@ app.post(
 
 // Admin: resolution override (SuperAdmin or CouncilMember).
 app.post(
-  '/api/admin/markets/:marketId/resolve',
-  requireAdminRole([ADMIN_ROLES.SUPER_ADMIN, ADMIN_ROLES.COUNCIL_MEMBER]),
-  (req, res) => {
-    const { marketId } = req.params;
-    const { outcome, reason } = req.body || {};
-    if (!outcome) {
-      recordAudit({
-        action: 'market.resolve.override',
-        caller: req.admin.wallet,
-        roles: req.admin.roles,
-        target: marketId,
-        outcome: 'rejected',
-        details: { reason: 'VALIDATION_FAILED' },
-      });
-      return sendError(res, 400, 'VALIDATION_FAILED', 'outcome is required');
-    }
+  '/api/admin/markets/:marketId/resolv
 
-    const entry = recordAudit({
-      action: 'market.resolve.override',
-      caller: req.admin.wallet,
-      roles: req.admin.roles,
-      target: marketId,
-      details: { outcome, reason: reason || null },
-    });
-
-    return res.json({
-      success: true,
-      data: { marketId, outcome, reason: reason || null, auditId: entry.id },
-    });
-  }
-);
-
-// Admin: inspect the audit log (SuperAdmin only).
-app.get(
-  '/api/admin/audit-log',
-  requireAdminRole([ADMIN_ROLES.SUPER_ADMIN]),
-  (req, res) => {
-    recordAudit({
-      action: 'audit.read',
-      caller: req.admin.wallet,
-      roles: req.admin.roles,
-    });
-    return res.json({ success: true, data: { entries: auditLog.slice() } });
-  }
-);
-
-// 404 handler: any unmatched route returns the uniform error envelope.
-app.use((req, res) => {
-  sendError(res, 404, 'NOT_FOUND', `Route ${req.method} ${req.originalUrl} not found`);
-});
-
-// Centralized error handler: maps domain/validation/unknown errors to the
-// uniform envelope `{ success: false, error: { code, message, details } }`.
-// eslint-disable-next-line no-unused-vars
-app.use((err, req, res, next) => {
-  if (res.headersSent) {
-    return next(err);
-  }
-
-  const statusCode = Number(err && (err.statusCode || err.status)) || 500;
-
-  if (statusCode >= 400 && statusCode < 500) {
-    const code = (err && err.code) || 'BAD_REQUEST';
-    const message = (err && err.message) || 'Request could not be processed';
-    const details = err && err.details;
-    return sendError(res, statusCode, code, message, details);
-  }
-
-  const trackingId = crypto.randomUUID();
-  // eslint-disable-next-line no-console
-  console.error(`[error] trackingId=${trackingId}`, err);
-  return sendError(res, 500, 'INTERNAL_SERVER_ERROR', 'An unexpected error occurred', {
-    trackingId,
-  });
-});
-
-module.exports = app;
+/* … truncated 2351 chars — edit only what you need near the top … */
