@@ -5,6 +5,10 @@
  * single transaction, and is idempotent on `(tx_hash, event_index)` so a replayed event is
  * applied once. The store is an interface so the handler runs against PostgreSQL in the indexer
  * and against an in-memory store in tests.
+ *
+ * Market stats (odds, implied probabilities, total pool sizes) are cached in a Redis hash per
+ * market (#241). The cache is updated incrementally after the transaction commits and is
+ * invalidated so the next read repopulates it from the database.
  */
 
 export interface BetPlacedEvent {
@@ -49,10 +53,30 @@ export interface BetStoreTx {
 }
 
 /**
- * Applies one BetPlaced event. Returns `false` when the event was already recorded.
+ * Minimal Redis surface used to cache market stats. Kept as an interface so the handler can run
+ * against ioredis in production and an in-memory fake in tests.
  */
-export async function handleBetPlaced(store: BetStore, event: BetPlacedEvent): Promise<boolean> {
-  return store.transaction(async (tx) => {
+export interface MarketStatsCache {
+  /** Returns the cached hash for a market, or `undefined` when the cache is cold. */
+  getMarketStats(marketId: number): Promise<MarketTotals | undefined>;
+  /** Writes the full stats hash for a market. */
+  setMarketStats(totals: MarketTotals): Promise<void>;
+  /** Drops the cached stats for a market so the next read falls back to the database. */
+  invalidateMarketStats(marketId: number): Promise<void>;
+}
+
+/**
+ * Applies one BetPlaced event. Returns `false` when the event was already recorded.
+ *
+ * When a `cache` is supplied, the market's cached stats are invalidated after the transaction
+ * commits so the next odds query repopulates from the database instead of serving stale odds.
+ */
+export async function handleBetPlaced(
+  store: BetStore,
+  event: BetPlacedEvent,
+  cache?: MarketStatsCache,
+): Promise<boolean> {
+  const applied = await store.transaction(async (tx) => {
     const existing = await tx.findBet(event.txHash, event.eventIndex);
     if (existing) {
       return false;
@@ -84,4 +108,31 @@ export async function handleBetPlaced(store: BetStore, event: BetPlacedEvent): P
 
     return true;
   });
+
+  if (applied && cache) {
+    await cache.invalidateMarketStats(event.marketId);
+  }
+
+  return applied;
+}
+
+/**
+ * Reads market stats from the cache, falling back to the database when the cache is cold and
+ * repopulating it so subsequent odds queries are served from Redis.
+ */
+export async function getMarketStats(
+  store: BetStore,
+  cache: MarketStatsCache,
+  marketId: number,
+): Promise<MarketTotals | undefined> {
+  const cached = await cache.getMarketStats(marketId);
+  if (cached) {
+    return cached;
+  }
+
+  const totals = await store.transaction((tx) => tx.getMarketTotals(marketId));
+  if (totals) {
+    await cache.setMarketStats(totals);
+  }
+  return totals;
 }

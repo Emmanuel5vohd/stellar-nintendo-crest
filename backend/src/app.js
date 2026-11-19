@@ -218,4 +218,146 @@ app.notifications = {
   WEBHOOK_MAX_ATTEMPTS,
 };
 
+// ---------------------------------------------------------------------------
+// Market stats cache (issue #241)
+//
+// Computed odds, implied probabilities, and total pool sizes are cached per
+// market in a Redis hash. Reads are served from cache when warm; on a cold
+// cache we fall back to the database loader and repopulate. New bets update
+// the cached totals incrementally so the primary DB is not re-scanned on every
+// market pageview.
+// ---------------------------------------------------------------------------
+
+const MARKET_STATS_TTL_SECONDS = 300;
+const MARKET_STATS_KEY_PREFIX = 'market:stats:';
+
+function marketStatsKey(marketId) {
+  return `${MARKET_STATS_KEY_PREFIX}${marketId}`;
+}
+
+function computeMarketStats(outcomes) {
+  const totalPool = outcomes.reduce((sum, o) => sum + (Number(o.pool) || 0), 0);
+  const stats = outcomes.map((o) => {
+    const pool = Number(o.pool) || 0;
+    const impliedProbability = totalPool > 0 ? pool / totalPool : 0;
+    const odds = impliedProbability > 0 ? 1 / impliedProbability : 0;
+    return {
+      outcomeId: o.outcomeId,
+      pool,
+      impliedProbability,
+      odds,
+    };
+  });
+  return { marketId: null, totalPool, outcomes: stats, updatedAt: Date.now() };
+}
+
+function serializeMarketStats(stats) {
+  return {
+    marketId: String(stats.marketId),
+    totalPool: String(stats.totalPool),
+    outcomes: JSON.stringify(stats.outcomes),
+    updatedAt: String(stats.updatedAt),
+  };
+}
+
+function deserializeMarketStats(hash) {
+  if (!hash || !hash.outcomes) return null;
+  return {
+    marketId: hash.marketId,
+    totalPool: Number(hash.totalPool) || 0,
+    outcomes: JSON.parse(hash.outcomes),
+    updatedAt: Number(hash.updatedAt) || 0,
+  };
+}
+
+function createMarketStatsCache({ redis, loadMarketOutcomes }) {
+  async function getMarketStats(marketId) {
+    if (redis) {
+      try {
+        const cached = await redis.hgetall(marketStatsKey(marketId));
+        const stats = deserializeMarketStats(cached);
+        if (stats) return stats;
+      } catch (err) {
+        // Cache read failure falls through to the database loader.
+      }
+    }
+
+    const outcomes = await loadMarketOutcomes(marketId);
+    const stats = computeMarketStats(outcomes);
+    stats.marketId = marketId;
+
+    if (redis) {
+      try {
+        const key = marketStatsKey(marketId);
+        await redis.hset(key, serializeMarketStats(stats));
+        await redis.expire(key, MARKET_STATS_TTL_SECONDS);
+      } catch (err) {
+        // Cache write failure is non-fatal; DB result is still returned.
+      }
+    }
+
+    return stats;
+  }
+
+  async function invalidateMarketStats(marketId) {
+    if (!redis) return;
+    try {
+      await redis.del(marketStatsKey(marketId));
+    } catch (err) {
+      // Ignore invalidation failures; TTL bounds staleness.
+    }
+  }
+
+  async function applyBetPlaced(event) {
+    const { marketId, outcomeId, amount } = event || {};
+    if (!marketId || !outcomeId) return;
+
+    if (!redis) return;
+
+    try {
+      const key = marketStatsKey(marketId);
+      const cached = await redis.hgetall(key);
+      const stats = deserializeMarketStats(cached);
+      if (!stats) {
+        // Cold cache: nothing to update incrementally; next read repopulates.
+        return;
+      }
+
+      const delta = Number(amount) || 0;
+      stats.totalPool += delta;
+      const outcome = stats.outcomes.find((o) => o.outcomeId === outcomeId);
+      if (outcome) {
+        outcome.pool += delta;
+      } else {
+        stats.outcomes.push({ outcomeId, pool: delta, impliedProbability: 0, odds: 0 });
+      }
+
+      stats.outcomes = stats.outcomes.map((o) => {
+        const impliedProbability = stats.totalPool > 0 ? o.pool / stats.totalPool : 0;
+        return {
+          ...o,
+          impliedProbability,
+          odds: impliedProbability > 0 ? 1 / impliedProbability : 0,
+        };
+      });
+      stats.updatedAt = Date.now();
+
+      await redis.hset(key, serializeMarketStats(stats));
+      await redis.expire(key, MARKET_STATS_TTL_SECONDS);
+    } catch (err) {
+      // On failure, invalidate so the next read rebuilds from the database.
+      await invalidateMarketStats(marketId);
+    }
+  }
+
+  return { getMarketStats, invalidateMarketStats, applyBetPlaced };
+}
+
+app.marketStats = {
+  createMarketStatsCache,
+  computeMarketStats,
+  marketStatsKey,
+  MARKET_STATS_TTL_SECONDS,
+};
+
 module.exports = app;
