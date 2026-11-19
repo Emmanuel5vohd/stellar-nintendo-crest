@@ -2,6 +2,8 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Map, String, Symbol, Vec};
 
+pub mod invariant;
+
 /// Default slippage tolerance in basis points (1% = 100 bps).
 /// Used by `place_bet_with_slippage` when the caller passes `0`.
 pub const DEFAULT_SLIPPAGE_BPS: u32 = 100;
@@ -415,3 +417,101 @@ impl PredictionMarket {
             
 
 /* … truncated 2125 chars — edit only what you need near the top … */
+
+// ── Balance conservation invariant (#286) ────────────────────────────────────
+
+impl PredictionMarket {
+    /// Verifies the pool balance conservation invariant at the current ledger state.
+    ///
+    /// Any external observer (monitoring bot, admin dashboard) can call this
+    /// read-only function to confirm that:
+    ///
+    /// ```text
+    /// contract_balance >= accumulated_fees + net_yes_pool + net_no_pool + escrowed_bonds
+    /// ```
+    ///
+    /// A strict `>=` is used because integer division in `claim` may leave
+    /// sub-stroop dust in the pool that is permanently unclaimable.
+    ///
+    /// Returns an `InvariantReport` with the breakdown. `holds` is `true`
+    /// when the invariant is satisfied and `false` when funds are missing
+    /// (which should be treated as a critical alert).
+    pub fn check_invariant(env: Env) -> InvariantReport {
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "config"))
+            .unwrap_or(Config {
+                admin: env.current_contract_address(),
+                fee_bps: 0,
+                accumulated_fees: 0,
+            });
+
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "token"))
+            .expect("token not set");
+
+        let token_client = token::Client::new(&env, &token);
+        let contract_balance = token_client.balance(&env.current_contract_address());
+
+        // Accumulate YES pool, NO pool, and escrowed bonds across all markets.
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, "next_id"))
+            .unwrap_or(0);
+
+        let mut net_yes_pool: i128 = 0;
+        let mut net_no_pool: i128 = 0;
+        let mut escrowed_bonds: i128 = 0;
+
+        for market_id in 0..next_id {
+            let maybe_market: Option<Market> = env
+                .storage()
+                .persistent()
+                .get(&Self::market_key(&env, market_id));
+            if let Some(market) = maybe_market {
+                // Net pools = gross wagers minus amounts already paid out via claim.
+                // `market.claimed` tracks the total payout (principal + cross-pool share)
+                // that has already left the contract, so it must be subtracted from the
+                // combined pool to avoid double-counting.
+                let gross_pool = market.total_yes + market.total_no;
+                let net_pool = gross_pool - market.claimed;
+                // Apportion the net pool proportionally to YES/NO sides.
+                if gross_pool > 0 {
+                    net_yes_pool += (net_pool * market.total_yes) / gross_pool;
+                    net_no_pool  += net_pool - (net_pool * market.total_yes) / gross_pool;
+                }
+                escrowed_bonds += market.escrowed_bonds;
+            }
+        }
+
+        let pool_sum = net_yes_pool + net_no_pool;
+        let expected_balance = config.accumulated_fees + pool_sum + escrowed_bonds;
+
+        // The invariant holds when the contract holds at least as much as owed.
+        // Strict equality would fail by dust from integer division truncation.
+        let holds = contract_balance >= expected_balance;
+
+        InvariantReport {
+            contract_balance,
+            expected_balance,
+            pool_sum,
+            accumulated_fees: config.accumulated_fees,
+            escrowed_bonds,
+            holds,
+        }
+    }
+
+    /// Storage key for a market.
+    fn market_key(env: &Env, id: u64) -> (Symbol, u64) {
+        (Symbol::new(env, "market"), id)
+    }
+
+    /// Storage key for a bettor's position in a market.
+    fn position_key(env: &Env, market_id: u64, bettor: &Address) -> (Symbol, u64, Address) {
+        (Symbol::new(env, "position"), market_id, bettor.clone())
+    }
+}
