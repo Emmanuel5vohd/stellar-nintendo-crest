@@ -1,6 +1,7 @@
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
+const { run: runMigrations } = require('./db/migrate');
 
 const app = express();
 
@@ -55,5 +56,22 @@ app.use(express.json());
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
+
+async function start() {
+  if (process.env.DATABASE_URL) {
+    await runMigrations({ direction: 'up' });
+  }
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => {
+    console.log(`[api] listening on ${port}`);
+  });
+}
+
+if (require.main === module) {
+  start().catch((err) => {
+    console.error('[api] failed to start:', err.message);
+    process.exit(1);
+  });
+}
 
 module.exports = app;
