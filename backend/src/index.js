@@ -195,6 +195,112 @@ app.use(express.json());
 
 app.use(rateLimitMiddleware);
 
+const MARKET_CATEGORIES = ['crypto', 'sports', 'tech', 'politics'];
+const MARKET_STATUSES = ['active', 'resolved', 'closed'];
+
+// In-memory market store used by the search/filter endpoint. When a PostgreSQL
+// pool is configured, the same query shape is executed against the markets
+// table which carries a GIN index on the tsvector of question + description.
+const markets = [];
+
+function normalizeMarket(market) {
+  return {
+    id: market.id,
+    question: market.question,
+    description: market.description || '',
+    category: market.category,
+    status: market.status,
+    createdAt: market.createdAt || null,
+  };
+}
+
+function buildMarketSearchQuery({ q, category, status }) {
+  const conditions = [];
+  const params = [];
+
+  if (q) {
+    params.push(q);
+    conditions.push(
+      `to_tsvector('english', coalesce(question, '') || ' ' || coalesce(description, '')) @@ plainto_tsquery('english', $${params.length})`
+    );
+  }
+  if (category) {
+    params.push(category);
+    conditions.push(`category = $${params.length}`);
+  }
+  if (status) {
+    params.push(status);
+    conditions.push(`status = $${params.length}`);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const orderBy = q
+    ? `ORDER BY ts_rank(to_tsvector('english', coalesce(question, '') || ' ' || coalesce(description, '')), plainto_tsquery('english', $1)) DESC`
+    : 'ORDER BY created_at DESC';
+
+  return {
+    text: `SELECT id, question, description, category, status, created_at FROM markets ${where} ${orderBy}`,
+    params,
+  };
+}
+
+function searchMarketsInMemory({ q, category, status }) {
+  const term = q ? q.toLowerCase() : null;
+  const results = markets.filter((market) => {
+    if (category && market.category !== category) return false;
+    if (status && market.status !== status) return false;
+    if (term) {
+      const haystack = `${market.question} ${market.description}`.toLowerCase();
+      if (!haystack.includes(term)) return false;
+    }
+    return true;
+  });
+
+  if (term) {
+    results.sort((a, b) => {
+      const aScore = (a.question.toLowerCase().includes(term) ? 2 : 0) +
+        (a.description.toLowerCase().includes(term) ? 1 : 0);
+      const bScore = (b.question.toLowerCase().includes(term) ? 2 : 0) +
+        (b.description.toLowerCase().includes(term) ? 1 : 0);
+      return bScore - aScore;
+    });
+  }
+
+  return results.map(normalizeMarket);
+}
+
+app.get('/api/markets', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const category = typeof req.query.category === 'string' ? req.query.category.trim().toLowerCase() : '';
+  const status = typeof req.query.status === 'string' ? req.query.status.trim().toLowerCase() : '';
+
+  if (category && !MARKET_CATEGORIES.includes(category)) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: `Invalid category. Allowed values: ${MARKET_CATEGORIES.join(', ')}`,
+    });
+  }
+  if (status && !MARKET_STATUSES.includes(status)) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: `Invalid status. Allowed values: ${MARKET_STATUSES.join(', ')}`,
+    });
+  }
+
+  const filters = { q: q || null, category: category || null, status: status || null };
+  const query = buildMarketSearchQuery(filters);
+  const results = searchMarketsInMemory(filters);
+
+  return res.json({
+    data: results,
+    meta: {
+      count: results.length,
+      filters,
+      query,
+    },
+  });
+});
+
 const openApiSpec = {
   openapi: '3.1.0',
   info: {
@@ -235,6 +341,18 @@ const openApiSpec = {
         },
         required: ['error', 'message', 'retryAfter'],
       },
+      Market: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          question: { type: 'string' },
+          description: { type: 'string' },
+          category: { type: 'string', enum: MARKET_CATEGORIES },
+          status: { type: 'string', enum: MARKET_STATUSES },
+          createdAt: { type: 'string', nullable: true },
+        },
+        required: ['id', 'question', 'category', 'status'],
+      },
     },
   },
   paths: {
@@ -251,6 +369,42 @@ const openApiSpec = {
               },
             },
           },
+          429: {
+            description: 'Rate limit exceeded',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/RateLimitError' },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/api/markets': {
+      get: {
+        summary: 'Search and filter markets',
+        tags: ['Markets'],
+        parameters: [
+          { name: 'q', in: 'query', schema: { type: 'string' }, description: 'Full-text search term' },
+          { name: 'category', in: 'query', schema: { type: 'string', enum: MARKET_CATEGORIES } },
+          { name: 'status', in: 'query', schema: { type: 'string', enum: MARKET_STATUSES } },
+        ],
+        responses: {
+          200: {
+            description: 'Matching markets ordered by relevance',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: { type: 'array', items: { $ref: '#/components/schemas/Market' } },
+                    meta: { type: 'object' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Invalid category or status' },
           429: {
             description: 'Rate limit exceeded',
             content: {

@@ -202,7 +202,111 @@ app.use((req, res, next) => {
   return limiter(req, res, next);
 });
 
+// --- Market search & filtering (issue #238) ---
+// Full-text search over market question/description using PostgreSQL
+// `tsvector` + GIN index, plus category and status filtering. The query is
+// built with parameterized placeholders to avoid SQL injection.
+const MARKET_CATEGORIES = ['crypto', 'sports', 'tech', 'politics'];
+const MARKET_STATUSES = ['active', 'closed', 'resolved', 'pending'];
+
+function buildMarketSearchQuery({ q, category, status, limit, offset }) {
+  const conditions = [];
+  const params = [];
+  let orderBy = 'm.created_at DESC';
+
+  if (q) {
+    params.push(q);
+    const rankParam = `$${params.length}`;
+    conditions.push(`m.search_vector @@ websearch_to_tsquery('english', ${rankParam})`);
+    orderBy = `ts_rank(m.search_vector, websearch_to_tsquery('english', ${rankParam})) DESC, m.created_at DESC`;
+  }
+
+  if (category) {
+    params.push(category);
+    conditions.push(`m.category = $${params.length}`);
+  }
+
+  if (status) {
+    params.push(status);
+    conditions.push(`m.status = $${params.length}`);
+  }
+
+  params.push(limit);
+  const limitParam = `$${params.length}`;
+  params.push(offset);
+  const offsetParam = `$${params.length}`;
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const sql = `
+    SELECT m.*
+    FROM markets m
+    ${where}
+    ORDER BY ${orderBy}
+    LIMIT ${limitParam} OFFSET ${offsetParam}
+  `;
+
+  return { sql, params };
+}
+
+function registerMarketSearchRoutes(db) {
+  app.get('/api/markets', async (req, res, next) => {
+    try {
+      const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+      const category = typeof req.query.category === 'string' ? req.query.category.trim().toLowerCase() : '';
+      const status = typeof req.query.status === 'string' ? req.query.status.trim().toLowerCase() : '';
+
+      if (category && !MARKET_CATEGORIES.includes(category)) {
+        return res.status(400).json({
+          error: 'Invalid category',
+          message: `category must be one of: ${MARKET_CATEGORIES.join(', ')}`,
+        });
+      }
+
+      if (status && !MARKET_STATUSES.includes(status)) {
+        return res.status(400).json({
+          error: 'Invalid status',
+          message: `status must be one of: ${MARKET_STATUSES.join(', ')}`,
+        });
+      }
+
+      const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+      const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+      const { sql, params } = buildMarketSearchQuery({
+        q: q || null,
+        category: category || null,
+        status: status || null,
+        limit,
+        offset,
+      });
+
+      const result = await db.query(sql, params);
+      return res.json({ markets: result.rows, limit, offset });
+    } catch (err) {
+      return next(err);
+    }
+  });
+}
+
+registerRouteSchema('/api/markets', 'get', {
+  summary: 'Search and filter markets',
+  tags: ['markets'],
+  parameters: [
+    { name: 'q', in: 'query', schema: { type: 'string' }, description: 'Full-text search query' },
+    { name: 'category', in: 'query', schema: { type: 'string', enum: MARKET_CATEGORIES } },
+    { name: 'status', in: 'query', schema: { type: 'string', enum: MARKET_STATUSES } },
+    { name: 'limit', in: 'query', schema: { type: 'integer', default: 20, maximum: 100 } },
+    { name: 'offset', in: 'query', schema: { type: 'integer', default: 0 } },
+  ],
+  responses: {
+    200: { description: 'Matching markets ordered by relevance' },
+    400: { description: 'Invalid category or status', content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } } },
+  },
+});
+
 app.registerRouteSchema = registerRouteSchema;
 app.openApiSpec = openApiSpec;
+app.registerMarketSearchRoutes = registerMarketSearchRoutes;
+app.buildMarketSearchQuery = buildMarketSearchQuery;
 
 module.exports = app;
