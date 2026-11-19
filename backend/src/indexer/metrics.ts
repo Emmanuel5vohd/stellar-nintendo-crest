@@ -43,6 +43,7 @@ export const indexerLagLedgers = define("indexer_lag_ledgers", "Chain head minus
 export const indexerEventsProcessedTotal = define("indexer_events_processed_total", "Contract events processed.", "counter");
 export const indexerErrorsTotal = define("indexer_errors_total", "Indexer errors.", "counter");
 export const indexerUnmappedEventsTotal = define("indexer_unmapped_events_total", "Contract events with no handler.", "counter");
+export const stellarTxConfirmationSeconds = define("stellar_tx_confirmation_seconds", "Stellar transaction confirmation latency in seconds.", "gauge");
 
 /** Sets a gauge to `value` for the given labels. */
 export function setGauge(def: MetricDef, value: number, labels: Labels = {}): void {
