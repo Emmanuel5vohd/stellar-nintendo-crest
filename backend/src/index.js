@@ -2,6 +2,7 @@ const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
 const { createClient } = require('redis');
+const swaggerUi = require('swagger-ui-express');
 
 const app = express();
 
@@ -193,6 +194,82 @@ app.use(
 app.use(express.json());
 
 app.use(rateLimitMiddleware);
+
+const openApiSpec = {
+  openapi: '3.1.0',
+  info: {
+    title: 'Handsoff API',
+    version: '1.0.0',
+    description: 'Automated OpenAPI specification for the Handsoff backend.',
+  },
+  servers: [{ url: '/', description: 'Current server' }],
+  components: {
+    securitySchemes: {
+      WalletAddress: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-Wallet-Address',
+        description: 'Wallet address used to identify authenticated callers.',
+      },
+      IndexerHook: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-Indexer-Hook',
+        description: 'Trusted indexer hook token for whitelisted integrations.',
+      },
+    },
+    schemas: {
+      HealthResponse: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', example: 'ok' },
+        },
+        required: ['status'],
+      },
+      RateLimitError: {
+        type: 'object',
+        properties: {
+          error: { type: 'string', example: 'Too Many Requests' },
+          message: { type: 'string', example: 'Rate limit exceeded. Please retry later.' },
+          retryAfter: { type: 'integer', example: 60 },
+        },
+        required: ['error', 'message', 'retryAfter'],
+      },
+    },
+  },
+  paths: {
+    '/health': {
+      get: {
+        summary: 'Service health check',
+        tags: ['System'],
+        responses: {
+          200: {
+            description: 'Service is healthy',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/HealthResponse' },
+              },
+            },
+          },
+          429: {
+            description: 'Rate limit exceeded',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/RateLimitError' },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
+app.get('/api/docs/json', (req, res) => {
+  res.json(openApiSpec);
+});
+
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openApiSpec));
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });

@@ -4,6 +4,7 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { RedisStore } = require('rate-limit-redis');
 const { createClient } = require('redis');
+const swaggerUi = require('swagger-ui-express');
 
 const app = express();
 
@@ -55,6 +56,65 @@ app.use(
 );
 
 app.use(express.json());
+
+// --- OpenAPI / Swagger documentation (issue #236) ---
+// OpenAPI 3.1 specification describing the public API surface. Route-level
+// schemas are merged in via `registerRouteSchema` so the spec stays in sync
+// with the actual handlers.
+const openApiSpec = {
+  openapi: '3.1.0',
+  info: {
+    title: 'Handsoff API',
+    version: process.env.npm_package_version || '1.0.0',
+    description: 'Automated OpenAPI documentation for the Handsoff backend.',
+  },
+  servers: [{ url: '/', description: 'Current host' }],
+  components: {
+    securitySchemes: {
+      bearerAuth: {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'JWT',
+      },
+      indexerToken: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'x-indexer-token',
+      },
+    },
+    schemas: {
+      Error: {
+        type: 'object',
+        properties: {
+          error: { type: 'string' },
+          message: { type: 'string' },
+          retryAfter: { type: 'integer' },
+        },
+        required: ['error'],
+      },
+    },
+  },
+  paths: {},
+};
+
+function registerRouteSchema(path, method, schema) {
+  if (!openApiSpec.paths[path]) {
+    openApiSpec.paths[path] = {};
+  }
+  openApiSpec.paths[path][method.toLowerCase()] = schema;
+}
+
+app.get('/api/docs/json', (req, res) => {
+  res.json(openApiSpec);
+});
+
+app.use(
+  '/api/docs',
+  swaggerUi.serve,
+  swaggerUi.setup(openApiSpec, {
+    swaggerOptions: { url: '/api/docs/json' },
+  })
+);
 
 // --- Tiered rate limiting (issue #235) ---
 // Shared Redis-backed store so limits are enforced across all instances.
@@ -141,5 +201,8 @@ app.use((req, res, next) => {
   const limiter = getWalletAddress(req) ? authLimiter : publicLimiter;
   return limiter(req, res, next);
 });
+
+app.registerRouteSchema = registerRouteSchema;
+app.openApiSpec = openApiSpec;
 
 module.exports = app;
