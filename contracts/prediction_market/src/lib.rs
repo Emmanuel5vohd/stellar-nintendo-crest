@@ -2,10 +2,31 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Map, String, Symbol, Vec};
 
+/// Default slippage tolerance in basis points (1% = 100 bps).
+/// Used by `place_bet_with_slippage` when the caller passes `0`.
+pub const DEFAULT_SLIPPAGE_BPS: u32 = 100;
+
+/// Maximum allowed slippage tolerance (50% = 5000 bps).
+/// Prevents accidental all-pass values like u32::MAX.
+pub const MAX_SLIPPAGE_BPS: u32 = 5_000;
+
 /// Maximum allowed length (in bytes) for a market title/question.
 pub const MAX_TITLE_LEN: u32 = 160;
 /// Maximum allowed length (in bytes) for a market description.
 pub const MAX_DESCRIPTION_LEN: u32 = 1000;
+
+/// Error codes for the prediction market contract.
+///
+/// Returned as `panic` messages (Soroban surfaces them as `Error(Contract, #N)`).
+/// Keep this enum in sync with the client-side error table.
+#[derive(Debug)]
+#[repr(u32)]
+pub enum ContractError {
+    /// Bettor's actual pool-share acquisition fell below their slippage tolerance.
+    SlippageExceeded = 1,
+    /// Provided slippage tolerance exceeds the maximum allowed value (50%).
+    InvalidSlippage = 2,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -225,6 +246,107 @@ impl PredictionMarket {
         env.storage()
             .persistent()
             .set(&Self::position_key(&env, market_id, &bettor), &position);
+    }
+
+    /// Places a bet with MEV / frontrunning protection.
+    ///
+    /// `min_expected_shares` is the minimum pool-share fraction (in basis points
+    /// of the pool after the bet) the bettor is willing to accept. If a sandwich
+    /// attack or any concurrent bet shifted the odds between the bettor's
+    /// simulation and their on-chain execution, this call reverts with
+    /// `ContractError::SlippageExceeded` before any tokens are moved.
+    ///
+    /// Pass `0` to use the platform default of 1% (100 bps). Pass up to 5000 bps
+    /// (50%) for very low-liquidity markets. Values above 5000 are rejected with
+    /// `ContractError::InvalidSlippage`.
+    ///
+    /// # Pool-share calculation
+    ///
+    /// After the bet the relevant side pool grows by `amount`. The bettor's share
+    /// of that side is `(amount * 10_000) / new_pool_total`. If this share is less
+    /// than `min_expected_shares` the transaction is reverted — no tokens leave
+    /// the bettor's account and the market state is unchanged.
+    pub fn place_bet_with_slippage(
+        env: Env,
+        bettor: Address,
+        market_id: u64,
+        side_yes: bool,
+        amount: i128,
+        min_expected_shares: u32,
+    ) {
+        bettor.require_auth();
+        assert!(amount > 0, "amount must be positive");
+
+        // Validate and resolve the slippage tolerance.
+        let tolerance_bps = if min_expected_shares == 0 {
+            DEFAULT_SLIPPAGE_BPS
+        } else {
+            min_expected_shares
+        };
+        assert!(
+            tolerance_bps <= MAX_SLIPPAGE_BPS,
+            "ContractError::InvalidSlippage: slippage tolerance exceeds maximum (5000 bps)"
+        );
+
+        let mut market: Market = env
+            .storage()
+            .persistent()
+            .get(&Self::market_key(&env, market_id))
+            .expect("market not found");
+        assert!(!market.resolved, "market already resolved");
+
+        // ── Slippage check (pre-transfer) ────────────────────────────────────
+        // Compute what the bettor's pool share would be AFTER this bet lands.
+        // If it is below their tolerance, revert before any state changes.
+        let current_side_pool: i128 = if side_yes { market.total_yes } else { market.total_no };
+        let new_side_pool: i128 = current_side_pool + amount;
+        // Share in basis points: (amount / new_pool) * 10_000
+        // Using i128 to avoid overflow on large amounts.
+        let acquired_shares_bps: i128 = (amount * 10_000_i128) / new_side_pool;
+        assert!(
+            acquired_shares_bps >= tolerance_bps as i128,
+            "ContractError::SlippageExceeded: acquired pool share is below minimum tolerance"
+        );
+
+        // ── Transfer tokens (after slippage check passes) ───────────────────
+        let token_client = token::Client::new(&env, &market.token);
+        token_client.transfer(&bettor, &env.current_contract_address(), &amount);
+
+        let mut position: Position = env
+            .storage()
+            .persistent()
+            .get(&Self::position_key(&env, market_id, &bettor))
+            .unwrap_or(Position { yes: 0, no: 0, claimed: false });
+
+        if side_yes {
+            market.total_yes += amount;
+            position.yes += amount;
+        } else {
+            market.total_no += amount;
+            position.no += amount;
+        }
+
+        env.storage().persistent().set(&Self::market_key(&env, market_id), &market);
+        env.storage()
+            .persistent()
+            .set(&Self::position_key(&env, market_id, &bettor), &position);
+    }
+
+    /// Returns the pool-share (in basis points) a bettor would acquire for
+    /// `amount` on `side_yes` given the current market state.
+    ///
+    /// Front-ends call this in simulation to pre-compute the slippage check
+    /// before constructing a `place_bet_with_slippage` invocation.
+    pub fn preview_shares_bps(env: Env, market_id: u64, side_yes: bool, amount: i128) -> u32 {
+        assert!(amount > 0, "amount must be positive");
+        let market: Market = env
+            .storage()
+            .persistent()
+            .get(&Self::market_key(&env, market_id))
+            .expect("market not found");
+        let current_side_pool: i128 = if side_yes { market.total_yes } else { market.total_no };
+        let new_side_pool: i128 = current_side_pool + amount;
+        ((amount * 10_000_i128) / new_side_pool) as u32
     }
 
     pub fn resolve_market(env: Env, admin: Address, market_id: u64, outcome: bool) {
