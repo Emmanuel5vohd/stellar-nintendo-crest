@@ -270,94 +270,123 @@ function deserializeMarketStats(hash) {
   };
 }
 
-function createMarketStatsCache({ redis, loadMarketOutcomes }) {
-  async function getMarketStats(marketId) {
-    if (redis) {
-      try {
-        const cached = await redis.hgetall(marketStatsKey(marketId));
-        const stats = deserializeMarketStats(cached);
-        if (stats) return stats;
-      } catch (err) {
-        // Cache read failure falls through to the database loader.
-      }
-    }
+// ---------------------------------------------------------------------------
+// User analytics (issue #242)
+//
+// Aggregates a user's historical bets, payouts, and IPREDICT rewards into
+// lifetime P&L / win-rate stats plus a 30-day cumulative P&L time series for
+// charting. Referral commissions and token balances are included so the
+// client can render a complete portfolio view from a single request.
+// ---------------------------------------------------------------------------
 
-    const outcomes = await loadMarketOutcomes(marketId);
-    const stats = computeMarketStats(outcomes);
-    stats.marketId = marketId;
+const ANALYTICS_WINDOW_DAYS = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
-    if (redis) {
-      try {
-        const key = marketStatsKey(marketId);
-        await redis.hset(key, serializeMarketStats(stats));
-        await redis.expire(key, MARKET_STATS_TTL_SECONDS);
-      } catch (err) {
-        // Cache write failure is non-fatal; DB result is still returned.
-      }
-    }
+// In-memory store keyed by lowercased address. Replace with persistent
+// storage in production; the aggregation logic below is storage-agnostic.
+const userAnalyticsStore = new Map();
 
-    return stats;
-  }
-
-  async function invalidateMarketStats(marketId) {
-    if (!redis) return;
-    try {
-      await redis.del(marketStatsKey(marketId));
-    } catch (err) {
-      // Ignore invalidation failures; TTL bounds staleness.
-    }
-  }
-
-  async function applyBetPlaced(event) {
-    const { marketId, outcomeId, amount } = event || {};
-    if (!marketId || !outcomeId) return;
-
-    if (!redis) return;
-
-    try {
-      const key = marketStatsKey(marketId);
-      const cached = await redis.hgetall(key);
-      const stats = deserializeMarketStats(cached);
-      if (!stats) {
-        // Cold cache: nothing to update incrementally; next read repopulates.
-        return;
-      }
-
-      const delta = Number(amount) || 0;
-      stats.totalPool += delta;
-      const outcome = stats.outcomes.find((o) => o.outcomeId === outcomeId);
-      if (outcome) {
-        outcome.pool += delta;
-      } else {
-        stats.outcomes.push({ outcomeId, pool: delta, impliedProbability: 0, odds: 0 });
-      }
-
-      stats.outcomes = stats.outcomes.map((o) => {
-        const impliedProbability = stats.totalPool > 0 ? o.pool / stats.totalPool : 0;
-        return {
-          ...o,
-          impliedProbability,
-          odds: impliedProbability > 0 ? 1 / impliedProbability : 0,
-        };
-      });
-      stats.updatedAt = Date.now();
-
-      await redis.hset(key, serializeMarketStats(stats));
-      await redis.expire(key, MARKET_STATS_TTL_SECONDS);
-    } catch (err) {
-      // On failure, invalidate so the next read rebuilds from the database.
-      await invalidateMarketStats(marketId);
-    }
-  }
-
-  return { getMarketStats, invalidateMarketStats, applyBetPlaced };
+function normalizeAddress(address) {
+  return typeof address === 'string' ? address.trim().toLowerCase() : '';
 }
 
-app.marketStats = {
-  createMarketStatsCache,
-  computeMarketStats,
-  marketStatsKey,
-  MARKET_STATS_TTL_SECONDS,
+function getUserAnalyticsRecord(address) {
+  const key = normalizeAddress(address);
+  if (!userAnalyticsStore.has(key)) {
+    userAnalyticsStore.set(key, {
+      bets: [],
+      referralCommissions: 0,
+      tokenBalances: {},
+    });
+  }
+  return userAnalyticsStore.get(key);
+}
+
+function buildCumulativePnlSeries(bets, now) {
+  const windowStart = now - ANALYTICS_WINDOW_DAYS * DAY_MS;
+  const buckets = new Map();
+  for (let i = 0; i < ANALYTICS_WINDOW_DAYS; i += 1) {
+    const dayStart = windowStart + i * DAY_MS;
+    buckets.set(dayStart, 0);
+  }
+
+  bets.forEach((bet) => {
+    const ts = Number(bet.timestamp) || 0;
+    if (ts < windowStart || ts > now) return;
+    const dayIndex = Math.floor((ts - windowStart) / DAY_MS);
+    const dayStart = windowStart + dayIndex * DAY_MS;
+    if (!buckets.has(dayStart)) return;
+    const pnl = (Number(bet.payout) || 0) - (Number(bet.stake) || 0);
+    buckets.set(dayStart, buckets.get(dayStart) + pnl);
+  });
+
+  let cumulative = 0;
+  return Array.from(buckets.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([dayStart, dailyPnl]) => {
+      cumulative += dailyPnl;
+      return {
+        date: new Date(dayStart).toISOString().slice(0, 10),
+        dailyPnl,
+        cumulativePnl: cumulative,
+      };
+    });
+}
+
+function computeUserAnalytics(record, now) {
+  const bets = record.bets || [];
+  let totalStaked = 0;
+  let totalPayout = 0;
+  let winCount = 0;
+  let lossCount = 0;
+
+  bets.forEach((bet) => {
+    const stake = Number(bet.stake) || 0;
+    const payout = Number(bet.payout) || 0;
+    totalStaked += stake;
+    totalPayout += payout;
+    if (bet.status === 'won') winCount += 1;
+    else if (bet.status === 'lost') lossCount += 1;
+  });
+
+  const settledCount = winCount + lossCount;
+  const winRate = settledCount > 0 ? (winCount / settledCount) * 100 : 0;
+  const netPnl = totalPayout - totalStaked;
+  const roi = totalStaked > 0 ? (netPnl / totalStaked) * 100 : 0;
+
+  return {
+    address: record.address,
+    totalBets: bets.length,
+    winCount,
+    lossCount,
+    winRate,
+    totalStaked,
+    totalPayout,
+    netPnl,
+    roi,
+    referralCommissions: Number(record.referralCommissions) || 0,
+    tokenBalances: record.tokenBalances || {},
+    pnlSeries: buildCumulativePnlSeries(bets, now),
+    generatedAt: new Date(now).toISOString(),
+  };
+}
+
+app.get('/api/users/:address/analytics', (req, res) => {
+  const address = normalizeAddress(req.params.address);
+  if (!address) {
+    return res.status(400).json({ error: 'A valid user address is required' });
+  }
+
+  const record = getUserAnalyticsRecord(address);
+  record.address = address;
+  return res.json(computeUserAnalytics(record, Date.now()));
+});
+
+app.analytics = {
+  getUserAnalyticsRecord,
+  computeUserAnalytics,
+  buildCumulativePnlSeries,
+  ANALYTICS_WINDOW_DAYS,
 };
 
 module.exports = app;

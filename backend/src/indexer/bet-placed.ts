@@ -9,6 +9,9 @@
  * Market stats (odds, implied probabilities, total pool sizes) are cached in a Redis hash per
  * market (#241). The cache is updated incrementally after the transaction commits and is
  * invalidated so the next read repopulates it from the database.
+ *
+ * Historical user P&L and ROI analytics (#242) are aggregated from the recorded bets, payouts,
+ * and IPREDICT rewards so the API can serve `/api/users/:address/analytics`.
  */
 
 export interface BetPlacedEvent {
@@ -135,4 +138,147 @@ export async function getMarketStats(
     await cache.setMarketStats(totals);
   }
   return totals;
+}
+
+/** One resolved bet outcome used to compute win/loss counts and P&L. */
+export interface ResolvedBet {
+  bettor: string;
+  /** Net amount staked (after fees), in the smallest token unit. */
+  netAmount: bigint;
+  /** Payout credited to the bettor when the market resolved in their favour, else `0n`. */
+  payout: bigint;
+  /** Whether the bet won. */
+  won: boolean;
+  timestamp: Date;
+}
+
+/** A single point in the cumulative P&L time series. */
+export interface PnlDataPoint {
+  /** ISO date (UTC, `YYYY-MM-DD`) the point covers. */
+  date: string;
+  /** Cumulative net profit/loss up to and including this day, in the smallest token unit. */
+  cumulativePnl: bigint;
+}
+
+/** Aggregated historical performance for one user. */
+export interface UserAnalytics {
+  address: string;
+  totalBets: number;
+  winCount: number;
+  lossCount: number;
+  /** Win rate as a percentage (0–100), rounded to two decimals. */
+  winRate: number;
+  /** Total amount staked across all bets, in the smallest token unit. */
+  totalVolume: bigint;
+  /** Net profit/loss across all resolved bets, in the smallest token unit. */
+  totalPnl: bigint;
+  /** Return on investment as a percentage, rounded to two decimals. */
+  roi: number;
+  /** Cumulative P&L over the trailing 30 days, one point per day, for charting. */
+  pnlSeries: PnlDataPoint[];
+  /** Referral commissions earned by the user, in the smallest token unit. */
+  referralCommissions: bigint;
+  /** Current token balances held by the user, keyed by token symbol. */
+  tokenBalances: Record<string, bigint>;
+}
+
+/** Source of the raw data needed to build a user's analytics. */
+export interface UserAnalyticsStore {
+  /** All resolved bets for the user, ordered by timestamp ascending. */
+  getResolvedBets(address: string): Promise<ResolvedBet[]>;
+  /** Total referral commissions earned by the user, in the smallest token unit. */
+  getReferralCommissions(address: string): Promise<bigint>;
+  /** Current token balances held by the user, keyed by token symbol. */
+  getTokenBalances(address: string): Promise<Record<string, bigint>>;
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const PNL_WINDOW_DAYS = 30;
+
+function toUtcDateKey(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function roundPercent(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+/**
+ * Builds the trailing 30-day cumulative P&L series. Each day's point carries the running total
+ * of net P&L (payout minus stake) for every resolved bet up to and including that day, so the
+ * series can be plotted directly as a cumulative growth curve.
+ */
+function buildPnlSeries(bets: ResolvedBet[], now: Date): PnlDataPoint[] {
+  const windowStart = new Date(now.getTime() - (PNL_WINDOW_DAYS - 1) * DAY_MS);
+  const startKey = toUtcDateKey(windowStart);
+
+  // Running P&L from bets before the window seeds the first point so the curve is continuous.
+  let running = 0n;
+  const dailyPnl = new Map<string, bigint>();
+  for (const bet of bets) {
+    const pnl = bet.payout - bet.netAmount;
+    const key = toUtcDateKey(bet.timestamp);
+    if (key < startKey) {
+      running += pnl;
+    } else {
+      dailyPnl.set(key, (dailyPnl.get(key) ?? 0n) + pnl);
+    }
+  }
+
+  const series: PnlDataPoint[] = [];
+  for (let i = 0; i < PNL_WINDOW_DAYS; i += 1) {
+    const day = new Date(windowStart.getTime() + i * DAY_MS);
+    const key = toUtcDateKey(day);
+    running += dailyPnl.get(key) ?? 0n;
+    series.push({ date: key, cumulativePnl: running });
+  }
+  return series;
+}
+
+/**
+ * Aggregates a user's historical bets, payouts, and IPREDICT rewards into total P&L, win rate,
+ * ROI, a 30-day cumulative P&L series, referral commissions, and token balances (#242).
+ */
+export async function getUserAnalytics(
+  store: UserAnalyticsStore,
+  address: string,
+  now: Date = new Date(),
+): Promise<UserAnalytics> {
+  const [bets, referralCommissions, tokenBalances] = await Promise.all([
+    store.getResolvedBets(address),
+    store.getReferralCommissions(address),
+    store.getTokenBalances(address),
+  ]);
+
+  let winCount = 0;
+  let lossCount = 0;
+  let totalVolume = 0n;
+  let totalPnl = 0n;
+  for (const bet of bets) {
+    totalVolume += bet.netAmount;
+    totalPnl += bet.payout - bet.netAmount;
+    if (bet.won) {
+      winCount += 1;
+    } else {
+      lossCount += 1;
+    }
+  }
+
+  const resolved = winCount + lossCount;
+  const winRate = resolved === 0 ? 0 : roundPercent((winCount / resolved) * 100);
+  const roi = totalVolume === 0n ? 0 : roundPercent((Number(totalPnl) / Number(totalVolume)) * 100);
+
+  return {
+    address,
+    totalBets: bets.length,
+    winCount,
+    lossCount,
+    winRate,
+    totalVolume,
+    totalPnl,
+    roi,
+    pnlSeries: buildPnlSeries(bets, now),
+    referralCommissions,
+    tokenBalances,
+  };
 }
