@@ -108,3 +108,117 @@ export function computeEventHash(
 export function eventHashFor(event: RawContractEvent): string {
   return computeEventHash(event.ledger, event.txHash, event.eventIndex);
 }
+
+/**
+ * Domain parser identifiers. Each monitored contract is mapped to one of these, so events are
+ * routed to the correct parser based on the emitting contract ID (#221).
+ */
+export type DomainParserId = "prediction-market" | "governance" | "sidecar-registry";
+
+/**
+ * One entry in the monitored-contract configuration. `address` is the on-chain contract ID and
+ * `parser` selects the domain parser that handles its events.
+ */
+export interface MonitoredContract {
+  address: string;
+  parser: DomainParserId;
+  /** Optional human-readable label used in log prefixes. Defaults to the parser id. */
+  label?: string;
+}
+
+/**
+ * Loads the array of monitored contracts from a JSON config value (env var or config file
+ * contents). Accepts either a bare array or an object with a `contracts` array.
+ *
+ * Invalid entries are skipped and reported via `onInvalid` rather than throwing, so a single
+ * bad entry never prevents the remaining contracts from being monitored.
+ */
+export function loadMonitoredContracts(
+  raw: string | undefined,
+  onInvalid: (reason: string) => void = () => {},
+): MonitoredContract[] {
+  if (!raw || raw.trim().length === 0) return [];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    onInvalid(`monitored contracts config is not valid JSON: ${String(err)}`);
+    return [];
+  }
+
+  const list = Array.isArray(parsed)
+    ? parsed
+    : typeof parsed === "object" && parsed !== null && Array.isArray((parsed as Record<string, unknown>).contracts)
+      ? ((parsed as Record<string, unknown>).contracts as unknown[])
+      : null;
+
+  if (list === null) {
+    onInvalid("monitored contracts config must be an array or an object with a contracts array");
+    return [];
+  }
+
+  const validParsers: DomainParserId[] = ["prediction-market", "governance", "sidecar-registry"];
+  const contracts: MonitoredContract[] = [];
+  const seen = new Set<string>();
+
+  for (const entry of list) {
+    if (typeof entry !== "object" || entry === null) {
+      onInvalid("contract entry is not an object");
+      continue;
+    }
+    const e = entry as Record<string, unknown>;
+    if (!isString(e.address)) {
+      onInvalid("contract entry is missing a non-empty address");
+      continue;
+    }
+    if (!isString(e.parser) || !validParsers.includes(e.parser as DomainParserId)) {
+      onInvalid(`contract ${e.address} has an unknown parser: ${String(e.parser)}`);
+      continue;
+    }
+    if (seen.has(e.address)) {
+      onInvalid(`duplicate contract address ignored: ${e.address}`);
+      continue;
+    }
+    seen.add(e.address);
+    contracts.push({
+      address: e.address,
+      parser: e.parser as DomainParserId,
+      label: isString(e.label) ? e.label : undefined,
+    });
+  }
+
+  return contracts;
+}
+
+/**
+ * Builds a lookup from contract address to its monitored-contract entry. Used to route each
+ * event to the appropriate domain parser based on the emitting contract ID (#221).
+ */
+export function buildContractRouter(
+  contracts: MonitoredContract[],
+): Map<string, MonitoredContract> {
+  const router = new Map<string, MonitoredContract>();
+  for (const contract of contracts) {
+    router.set(contract.address, contract);
+  }
+  return router;
+}
+
+/**
+ * Resolves the monitored contract for an event, or `undefined` when the emitting contract is
+ * not configured. Callers can use this to skip unknown contracts without stopping listeners.
+ */
+export function routeEvent(
+  router: Map<string, MonitoredContract>,
+  event: RawContractEvent,
+): MonitoredContract | undefined {
+  return router.get(event.contractId);
+}
+
+/**
+ * Formats a log prefix identifying the source contract for a log line (#221).
+ */
+export function contractLogPrefix(contract: MonitoredContract): string {
+  return `[${contract.label ?? contract.parser}:${contract.address}]`;
+}
