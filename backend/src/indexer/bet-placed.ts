@@ -16,6 +16,26 @@ export interface BetPlacedEvent {
   grossAmount: bigint;
   netAmount: bigint;
   timestamp: Date;
+  /** Contract method invoked by the transaction (e.g. `place_bet`). */
+  contractMethod?: string;
+  /** Resource telemetry parsed from the transaction envelope result (#219). */
+  telemetry?: TxTelemetry;
+}
+
+/**
+ * Per-transaction gas/resource telemetry (#219). Parsed from the transaction envelope result
+ * and stored alongside the bet/market records so protocol developers can track gas trends.
+ */
+export interface TxTelemetry {
+  cpuInstructions: bigint;
+  ramBytes: bigint;
+  feeStroops: bigint;
+}
+
+export interface TxTelemetryRow extends TxTelemetry {
+  txHash: string;
+  eventIndex: number;
+  contractMethod: string;
 }
 
 export interface BetRow {
@@ -46,6 +66,8 @@ export interface BetStoreTx {
   insertBet(row: BetRow): Promise<void>;
   getMarketTotals(marketId: number): Promise<MarketTotals | undefined>;
   setMarketTotals(totals: MarketTotals): Promise<void>;
+  /** Persists gas/resource telemetry for the transaction (#219). */
+  insertTxTelemetry(row: TxTelemetryRow): Promise<void>;
 }
 
 /**
@@ -127,6 +149,17 @@ export async function handleBetPlaced(store: BetStore, event: BetPlacedEvent): P
           totalNo: current.totalNo + (event.isYes ? 0n : event.netAmount),
           betCount: current.betCount + 1,
         });
+
+        if (event.telemetry) {
+          await tx.insertTxTelemetry({
+            txHash: event.txHash,
+            eventIndex: event.eventIndex,
+            contractMethod: event.contractMethod ?? 'bet_placed',
+            cpuInstructions: event.telemetry.cpuInstructions,
+            ramBytes: event.telemetry.ramBytes,
+            feeStroops: event.telemetry.feeStroops,
+          });
+        }
 
         return true;
       });

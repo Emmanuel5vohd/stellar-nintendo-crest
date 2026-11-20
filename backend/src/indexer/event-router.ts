@@ -113,12 +113,96 @@ export function toDlqEntry(event: RawContractEvent, error: unknown): DlqEntry {
   };
 }
 
+/**
+ * Per-invocation gas and resource telemetry (#219). `cpuInstructions` and `ramBytes` come from
+ * the transaction envelope result; `feeStroops` is the fee actually paid. `contractMethod` is
+ * the contract function that was invoked, used to aggregate consumption trends.
+ */
+export interface TxTelemetry {
+  txHash: string;
+  contractMethod: string;
+  cpuInstructions: number;
+  ramBytes: number;
+  feeStroops: bigint;
+  ledgerSequence: number;
+}
+
+/** Persists one telemetry row to the `tx_telemetry` table (#219). */
+export type TxTelemetryWriter = (telemetry: TxTelemetry) => Promise<void>;
+
+/**
+ * Extracts gas and resource telemetry from a raw contract event's envelope result (#219).
+ * Returns `null` when the event carries no telemetry (e.g. backfilled events without envelope
+ * data) so ingestion is never blocked by missing metrics.
+ *
+ * Expected payload shape: `{ txHash, contractMethod, cpuInstructions, ramBytes, feeStroops }`.
+ */
+export function extractTxTelemetry(event: RawContractEvent): TxTelemetry | null {
+  const payload = event.data as Record<string, unknown> | null | undefined;
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const txHash = payload.txHash;
+  const contractMethod = payload.contractMethod;
+  if (typeof txHash !== "string" || txHash.length === 0) {
+    return null;
+  }
+  if (typeof contractMethod !== "string" || contractMethod.length === 0) {
+    return null;
+  }
+
+  const cpuInstructions = toNonNegativeInt(payload.cpuInstructions);
+  const ramBytes = toNonNegativeInt(payload.ramBytes);
+  const feeStroops = toNonNegativeBigInt(payload.feeStroops);
+  if (cpuInstructions === null || ramBytes === null || feeStroops === null) {
+    return null;
+  }
+
+  const ledgerSequence =
+    typeof event.ledgerSequence === "number" ? event.ledgerSequence : 0;
+
+  return { txHash, contractMethod, cpuInstructions, ramBytes, feeStroops, ledgerSequence };
+}
+
+function toNonNegativeInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return Math.trunc(value);
+  }
+  if (typeof value === "string" && value.length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return Math.trunc(parsed);
+    }
+  }
+  return null;
+}
+
+function toNonNegativeBigInt(value: unknown): bigint | null {
+  try {
+    if (typeof value === "bigint") {
+      return value >= 0n ? value : null;
+    }
+    if (typeof value === "string" && value.length > 0) {
+      const parsed = BigInt(value);
+      return parsed >= 0n ? parsed : null;
+    }
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return BigInt(Math.trunc(value));
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export class EventRouter {
   private readonly handlers = new Map<string, EventHandler>();
 
   constructor(
     private readonly onUnmapped: UnmappedHandler,
     private readonly dlqWriter?: DlqWriter,
+    private readonly telemetryWriter?: TxTelemetryWriter,
   ) {}
 
   /** Registers the handler for one topic. A topic can have only one handler. */
@@ -133,6 +217,9 @@ export class EventRouter {
    * Routes one event to its handler. Returns `false` when no handler is registered. When a
    * handler throws (decode/validation failure), the event is written to the DLQ and `false` is
    * returned so a single bad event cannot crash the indexer (#218).
+   *
+   * Gas/resource telemetry is recorded alongside the handler (#219). Telemetry failures are
+   * swallowed so they never affect ingestion latency or correctness.
    */
   async dispatchContractEvent(event: RawContractEvent): Promise<boolean> {
     const handler = this.handlers.get(event.topic);
@@ -142,12 +229,28 @@ export class EventRouter {
     }
     try {
       await handler(event);
+      await this.recordTelemetry(event);
       return true;
     } catch (error) {
       if (this.dlqWriter) {
         await this.dlqWriter(toDlqEntry(event, error));
       }
       return false;
+    }
+  }
+
+  private async recordTelemetry(event: RawContractEvent): Promise<void> {
+    if (!this.telemetryWriter) {
+      return;
+    }
+    const telemetry = extractTxTelemetry(event);
+    if (!telemetry) {
+      return;
+    }
+    try {
+      await this.telemetryWriter(telemetry);
+    } catch {
+      // Telemetry is best-effort; never fail ingestion over it (#219).
     }
   }
 }
@@ -164,8 +267,9 @@ export function buildUserEventRouter(
   },
   onUnmapped: UnmappedHandler,
   dlqWriter?: DlqWriter,
+  telemetryWriter?: TxTelemetryWriter,
 ): EventRouter {
-  const router = new EventRouter(onUnmapped, dlqWriter);
+  const router = new EventRouter(onUnmapped, dlqWriter, telemetryWriter);
   router.register("claim", handlers.claim);
   router.register("fee_withdrawn", handlers.feeWithdrawn);
   router.register("reward_points", handlers.rewardPoints);
@@ -248,18 +352,17 @@ export function buildTokenEventRouter(
   },
   onUnmapped: UnmappedHandler,
   dlqWriter?: DlqWriter,
+  telemetryWriter?: TxTelemetryWriter,
 ): EventRouter {
-  const router = new EventRouter(onUnmapped, dlqWriter);
+  const router = new EventRouter(onUnmapped, dlqWriter, telemetryWriter);
   const route = async (event: RawContractEvent): Promise<void> => {
     const decoded = decodeTokenEvent(event);
     if (!decoded) {
       if (dlqWriter) {
-        await dlqWriter(
-          toDlqEntry(event, new Error(`malformed ${event.topic} event payload`)),
-        );
-        return;
+        await dlqWriter(toDlqEntry(event, new Error("undecodable token event")));
+      } else {
+        onUnmapped(event);
       }
-      onUnmapped(event);
       return;
     }
     await handlers.recordTokenEvent(decoded);
