@@ -149,3 +149,108 @@ export class OracleDaemon extends EventEmitter {
     }
   }
 }
+
+export interface ProposedOutcome {
+  marketId: string;
+  proposedPrice: number;
+  proposedAt: number;
+}
+
+export interface OutcomeChallenger {
+  challengeOutcome: (marketId: string, bond: number) => Promise<void>;
+}
+
+export interface DisputeWebhook {
+  notify: (payload: DisputeAlertPayload) => Promise<void>;
+}
+
+export interface DisputeAlertPayload {
+  marketId: string;
+  proposedPrice: number;
+  canonicalPrice: number;
+  deviation: number;
+  bond: number;
+  challengedAt: number;
+}
+
+export interface DisputeBotConfig {
+  aggregator: PriceAggregator;
+  challenger: OutcomeChallenger;
+  webhook: DisputeWebhook;
+  intervalMs: number;
+  discrepancyThreshold: number;
+  challengeBond: number;
+}
+
+export class DisputeBot extends EventEmitter {
+  private config: DisputeBotConfig;
+  private timer: NodeJS.Timeout | null = null;
+  private running = false;
+
+  constructor(config: DisputeBotConfig) {
+    super();
+    this.config = config;
+  }
+
+  async evaluate(proposal: ProposedOutcome): Promise<boolean> {
+    const aggregated = await this.config.aggregator.aggregate();
+    const canonicalPrice = aggregated.median;
+    const deviation =
+      Math.abs(proposal.proposedPrice - canonicalPrice) / canonicalPrice;
+
+    if (deviation <= this.config.discrepancyThreshold) {
+      return false;
+    }
+
+    await this.config.challenger.challengeOutcome(
+      proposal.marketId,
+      this.config.challengeBond,
+    );
+
+    const alert: DisputeAlertPayload = {
+      marketId: proposal.marketId,
+      proposedPrice: proposal.proposedPrice,
+      canonicalPrice,
+      deviation,
+      bond: this.config.challengeBond,
+      challengedAt: Date.now(),
+    };
+
+    try {
+      await this.config.webhook.notify(alert);
+    } catch (err) {
+      this.emit('error', err);
+    }
+
+    this.emit('challenged', alert);
+    return true;
+  }
+
+  start(fetchProposals: () => Promise<ProposedOutcome[]>): void {
+    if (this.running) return;
+    this.running = true;
+    const loop = async () => {
+      if (!this.running) return;
+      try {
+        const proposals = await fetchProposals();
+        for (const proposal of proposals) {
+          await this.evaluate(proposal);
+        }
+      } catch (err) {
+        this.emit('error', err);
+      }
+      if (this.running) {
+        this.timer = setTimeout(loop, this.config.intervalMs);
+      }
+    };
+    void loop();
+  }
+
+  stop(): void {
+    this.running = false;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+}
