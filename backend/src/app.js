@@ -168,6 +168,118 @@ app.get('/api/bets', async (req, res, next) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Tax reporting export (issue #247)
+//
+// Streams an itemized ledger of a user's capital transactions (bets, claims,
+// referral rewards, fees) as CSV (CoinTracker/Koinly compatible) or JSON.
+// Rows are pulled in keyset-paginated batches and written to the response as
+// they arrive so large histories never buffer fully in memory.
+// ---------------------------------------------------------------------------
+
+const EXPORT_BATCH_SIZE = 500;
+const EXPORT_COLUMNS = [
+  'date',
+  'tx_hash',
+  'type',
+  'asset',
+  'amount',
+  'fee',
+  'net_payout',
+  'usd_value',
+];
+
+function csvEscape(value) {
+  if (value == null) return '';
+  const str = String(value);
+  if (/[",\n\r]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+}
+
+function normalizeExportRow(row) {
+  return {
+    date: row.created_at != null ? new Date(row.created_at).toISOString() : '',
+    tx_hash: row.tx_hash || '',
+    type: row.type || '',
+    asset: row.asset || '',
+    amount: row.amount != null ? row.amount : '',
+    fee: row.fee != null ? row.fee : 0,
+    net_payout: row.net_payout != null ? row.net_payout : '',
+    usd_value: row.usd_value != null ? row.usd_value : '',
+  };
+}
+
+async function streamExport(req, res, next) {
+  const { address } = req.params;
+  const format = String(req.query.format || 'csv').toLowerCase();
+
+  if (format !== 'csv' && format !== 'json') {
+    return res.status(400).json({ error: "Unsupported format. Use 'csv' or 'json'." });
+  }
+
+  const db = req.app.locals.db;
+  const isCsv = format === 'csv';
+
+  res.setHeader('Content-Type', isCsv ? 'text/csv; charset=utf-8' : 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="transactions-${address}.${format}"`);
+  res.setHeader('Cache-Control', 'no-store');
+
+  try {
+    if (isCsv) {
+      res.write(`${EXPORT_COLUMNS.join(',')}\n`);
+    } else {
+      res.write('[');
+    }
+
+    let cursor = null;
+    let first = true;
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const keyset = buildKeysetClause(cursor);
+      const where = keyset
+        ? `WHERE address = ? AND ${keyset.clause}`
+        : 'WHERE address = ?';
+      const params = keyset ? [address, ...keyset.params] : [address];
+      params.push(EXPORT_BATCH_SIZE);
+
+      const sql = `SELECT * FROM transactions ${where} ORDER BY created_at DESC, id DESC LIMIT ?`;
+      const rows = await db(sql, params);
+
+      if (!rows || rows.length === 0) break;
+
+      for (const raw of rows) {
+        const row = normalizeExportRow(raw);
+        if (isCsv) {
+          res.write(`${EXPORT_COLUMNS.map((col) => csvEscape(row[col])).join(',')}\n`);
+        } else {
+          res.write(`${first ? '' : ','}${JSON.stringify(row)}`);
+          first = false;
+        }
+      }
+
+      if (rows.length < EXPORT_BATCH_SIZE) break;
+      cursor = { created_at: rows[rows.length - 1].created_at, id: rows[rows.length - 1].id };
+    }
+
+    if (!isCsv) {
+      res.write(']');
+    }
+    res.end();
+  } catch (err) {
+    // If headers already sent we cannot switch to a JSON error response.
+    if (res.headersSent) {
+      res.end();
+      return;
+    }
+    next(err);
+  }
+}
+
+app.get('/api/users/:address/export', streamExport);
+
 module.exports = app;
 module.exports.encodeCursor = encodeCursor;
 module.exports.decodeCursor = decodeCursor;
