@@ -300,3 +300,6 @@ pg_ctl -D "$PGDATA" -w stop
 
 <!-- handsoff-issue-197 -->
 - #197: feat(contracts): implement dynamic timelock duration based on market dispute escalation level
+
+<!-- handsoff-issue-200 -->
+- #200: fix(contracts): guard referral bonus minting against circular and self-referral exploits
