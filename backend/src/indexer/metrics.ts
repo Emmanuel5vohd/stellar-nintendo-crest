@@ -43,6 +43,7 @@ export const indexerLagLedgers = define("indexer_lag_ledgers", "Chain head minus
 export const indexerEventsProcessedTotal = define("indexer_events_processed_total", "Contract events processed.", "counter");
 export const indexerErrorsTotal = define("indexer_errors_total", "Indexer errors.", "counter");
 export const indexerUnmappedEventsTotal = define("indexer_unmapped_events_total", "Contract events with no handler.", "counter");
+export const stellarTxConfirmationSeconds = define("stellar_tx_confirmation_seconds", "Stellar transaction confirmation latency in seconds.", "gauge");
 
 export const pgPoolActiveConnections = define("pg_pool_active_connections", "Number of active connections.", "gauge");
 export const pgPoolIdleConnections = define("pg_pool_idle_connections", "Number of idle connections.", "gauge");
