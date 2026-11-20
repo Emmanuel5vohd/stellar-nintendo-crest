@@ -6,6 +6,7 @@
  * so both run the same handler code. Topics with no handler are reported, not dropped.
  */
 
+import { Address, StrKey, scValToNative, xdr } from "@stellar/stellar-sdk";
 import type { RawContractEvent } from "./event-schema";
 
 export type EventHandler = (event: RawContractEvent) => Promise<void>;
@@ -52,6 +53,48 @@ export type BroadcastTopic = (typeof BROADCAST_TOPICS)[number];
  * router stays transport-agnostic and does not duplicate indexing logic.
  */
 export type BroadcastHandler = (topic: BroadcastTopic, event: RawContractEvent) => void;
+
+/**
+ * Typed model for a decoded Soroban contract event topic (#212). Each ScVal variant maps to a
+ * discriminated shape so downstream handlers never have to re-inspect raw XDR.
+ */
+export type ScValTopic =
+  | { kind: "symbol"; value: string }
+  | { kind: "address"; value: string; addressType: "account" | "contract" | "muxed" }
+  | { kind: "i128"; value: bigint }
+  | { kind: "u64"; value: bigint }
+  | { kind: "vec"; value: ScValTopic[] }
+  | { kind: "unknown"; rawHex: string };
+
+/**
+ * Decodes one raw ScVal topic into a typed model (#212). Uses strict type checking and an
+ * exhaustive switch over the ScVal union so Symbol, Address, I128, U64 and Vec are handled
+ * accurately. Unexpected shapes are logged with the raw hex payload instead of throwing.
+ */
+export function parseScValTopic(scVal: xdr.ScVal): ScValTopic {
+  switch (scVal.switch().name) {
+    case "scvSymbol":
+      return { kind: "symbol", value: scVal.sym().toString() };
+    case "scvAddress": {
+      const address = Address.fromScVal(scVal);
+      const addressType = address.switch().name === "scAddressTypeMuxedAccount" ? "muxed" : address.switch().name === "scAddressTypeContract" ? "contract" : "account";
+      return { kind: "address", value: address.toString(), addressType };
+    }
+    case "scvI128":
+      return { kind: "i128", value: scValToNative(scVal) as bigint };
+    case "scvU64":
+      return { kind: "u64", value: scValToNative(scVal) as bigint };
+    case "scvVec": {
+      const inner = scVal.vec() ?? [];
+      return { kind: "vec", value: inner.map((item) => parseScValTopic(item)) };
+    }
+    default: {
+      const rawHex = scVal.toXDR().toString("hex");
+      console.error(`[event-router] unexpected ScVal topic shape ${scVal.switch().name}: 0x${rawHex}`);
+      return { kind: "unknown", rawHex };
+    }
+  }
+}
 
 export class EventRouter {
   private readonly handlers = new Map<string, EventHandler>();

@@ -9,6 +9,8 @@
  * installed yet. The shape is the same as a zod schema would describe.
  */
 
+import { Address, scValToNative, xdr } from "@stellar/stellar-sdk";
+
 export interface RawContractEvent {
   topic: string;
   contractId: string;
@@ -71,6 +73,82 @@ export function parseEventsOrDeadLetter(
     }
   }
   return valid;
+}
+
+/**
+ * Typed model for a decoded Soroban ScVal topic (#212).
+ */
+export type ScValTopic =
+  | { kind: "symbol"; value: string }
+  | { kind: "address"; value: string; addressType: "account" | "contract" | "muxed" }
+  | { kind: "i128"; value: string }
+  | { kind: "u64"; value: string }
+  | { kind: "vec"; value: ScValTopic[] };
+
+export type ScValParseResult =
+  | { ok: true; topic: ScValTopic }
+  | { ok: false; reasons: string[] };
+
+/**
+ * Decodes a single raw ScVal topic into a typed model. Uses `@stellar/stellar-sdk` with strict
+ * type checking and an exhaustive switch over the ScVal variants we support. Unexpected shapes
+ * are reported (with the raw hex payload) instead of throwing.
+ */
+export function parseScValTopic(raw: unknown): ScValParseResult {
+  let scv: xdr.ScVal;
+  try {
+    scv = typeof raw === "string" ? xdr.ScVal.fromXDR(raw, "base64") : (raw as xdr.ScVal);
+  } catch (err) {
+    return { ok: false, reasons: [`unable to decode ScVal: ${String(err)}`] };
+  }
+
+  if (!scv || typeof scv.switch !== "function") {
+    return { ok: false, reasons: ["unexpected ScVal shape: not an ScVal"] };
+  }
+
+  const rawHex = safeHex(scv);
+  try {
+    return { ok: true, topic: decodeScVal(scv) };
+  } catch (err) {
+    return {
+      ok: false,
+      reasons: [`unexpected ScVal shape (${String(err)}); raw=${rawHex}`],
+    };
+  }
+}
+
+function safeHex(scv: xdr.ScVal): string {
+  try {
+    return scv.toXDR().toString("hex");
+  } catch {
+    return "<unencodable>";
+  }
+}
+
+function decodeScVal(scv: xdr.ScVal): ScValTopic {
+  switch (scv.switch().name) {
+    case "scvSymbol":
+      return { kind: "symbol", value: scv.sym().toString() };
+    case "scvAddress": {
+      const address = Address.fromScVal(scv);
+      const addressType = address.type();
+      return { kind: "address", value: address.toString(), addressType };
+    }
+    case "scvI128": {
+      const native = scValToNative(scv) as bigint;
+      return { kind: "i128", value: native.toString() };
+    }
+    case "scvU64": {
+      const native = scValToNative(scv) as bigint;
+      return { kind: "u64", value: native.toString() };
+    }
+    case "scvVec": {
+      const items = scv.vec() ?? [];
+      return { kind: "vec", value: items.map((item) => decodeScVal(item)) };
+    }
+    default:
+      throw new Error(`unsupported ScVal variant: ${scv.switch().name}`);
+  }
 }
 
 /**
