@@ -39,9 +39,24 @@ interface BatchQueue {
   flushing: Promise<void> | null;
 }
 
+/**
+ * Topics broadcast to real-time WebSocket clients (#211). These are the user-facing events the
+ * frontend needs sub-second, so they are published to the broadcast bridge as they are indexed.
+ */
+export const BROADCAST_TOPICS = ["bet.placed", "market.resolved", "dispute.created"] as const;
+
+export type BroadcastTopic = (typeof BROADCAST_TOPICS)[number];
+
+/**
+ * Sink for real-time event broadcasting (#211). The WebSocket bridge implements this so the
+ * router stays transport-agnostic and does not duplicate indexing logic.
+ */
+export type BroadcastHandler = (topic: BroadcastTopic, event: RawContractEvent) => void;
+
 export class EventRouter {
   private readonly handlers = new Map<string, EventHandler>();
   private readonly batchQueues = new Map<string, BatchQueue>();
+  private broadcast: BroadcastHandler | null = null;
 
   constructor(private readonly onUnmapped: UnmappedHandler) {}
 
@@ -72,8 +87,17 @@ export class EventRouter {
     });
   }
 
+  /**
+   * Attaches the real-time broadcast sink (#211). Broadcast topics are published here as soon as
+   * they are dispatched, independent of persistence, so clients see sub-second updates.
+   */
+  setBroadcast(handler: BroadcastHandler): void {
+    this.broadcast = handler;
+  }
+
   /** Routes one event to its handler. Returns `false` when no handler is registered. */
   async dispatchContractEvent(event: RawContractEvent): Promise<boolean> {
+    this.publishBroadcast(event);
     const batch = this.batchQueues.get(event.topic);
     if (batch) {
       this.enqueue(batch, event);
@@ -94,6 +118,20 @@ export class EventRouter {
    */
   async flushAll(): Promise<void> {
     await Promise.all([...this.batchQueues.values()].map((queue) => this.flush(queue)));
+  }
+
+  private publishBroadcast(event: RawContractEvent): void {
+    if (!this.broadcast) {
+      return;
+    }
+    if (!(BROADCAST_TOPICS as readonly string[]).includes(event.topic)) {
+      return;
+    }
+    try {
+      this.broadcast(event.topic as BroadcastTopic, event);
+    } catch {
+      // Broadcasting is best-effort; a failed publish must never break indexing.
+    }
   }
 
   private enqueue(queue: BatchQueue, event: RawContractEvent): void {
