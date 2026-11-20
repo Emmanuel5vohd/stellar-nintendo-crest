@@ -44,6 +44,10 @@ export const indexerEventsProcessedTotal = define("indexer_events_processed_tota
 export const indexerErrorsTotal = define("indexer_errors_total", "Indexer errors.", "counter");
 export const indexerUnmappedEventsTotal = define("indexer_unmapped_events_total", "Contract events with no handler.", "counter");
 
+export const pgPoolActiveConnections = define("pg_pool_active_connections", "Number of active connections.", "gauge");
+export const pgPoolIdleConnections = define("pg_pool_idle_connections", "Number of idle connections.", "gauge");
+export const pgPoolWaitingQueries = define("pg_pool_waiting_queries", "Number of queries waiting for a connection.", "gauge");
+
 /** Sets a gauge to `value` for the given labels. */
 export function setGauge(def: MetricDef, value: number, labels: Labels = {}): void {
   def.series.set(labelKey(labels), { labels, value });
