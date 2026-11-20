@@ -150,6 +150,56 @@ impl IPredictTokenContract {
         env.storage().instance().get(&DataKey::Decimals).unwrap_or(7)
     }
 
+    /// Compute the required challenger dispute bond for a market resolution (#201).
+    ///
+    /// The bond decays linearly from `base_bond` at the start of the resolution
+    /// window down to `min_bond` as the window approaches expiration, encouraging
+    /// legitimate late challenges while preserving a Sybil-resistant floor.
+    ///
+    /// `base_bond * (remaining_time / total_window)`, clamped to `[min_bond, base_bond]`.
+    pub fn dispute_bond(
+        env: Env,
+        base_bond: i128,
+        min_bond: i128,
+        window_start: u64,
+        window_end: u64,
+    ) -> i128 {
+        Self::compute_dispute_bond(&env, base_bond, min_bond, window_start, window_end)
+    }
+
+    fn compute_dispute_bond(
+        env: &Env,
+        base_bond: i128,
+        min_bond: i128,
+        window_start: u64,
+        window_end: u64,
+    ) -> i128 {
+        if base_bond <= 0 {
+            return 0;
+        }
+        let floor = if min_bond < 0 { 0 } else { min_bond };
+        if window_end <= window_start {
+            return floor.min(base_bond);
+        }
+        let now = env.ledger().timestamp();
+        if now <= window_start {
+            return base_bond;
+        }
+        if now >= window_end {
+            return floor.min(base_bond);
+        }
+        let total = (window_end - window_start) as i128;
+        let remaining = (window_end - now) as i128;
+        let decayed = base_bond.saturating_mul(remaining) / total;
+        if decayed < floor {
+            floor.min(base_bond)
+        } else if decayed > base_bond {
+            base_bond
+        } else {
+            decayed
+        }
+    }
+
     fn require_admin(env: &Env) -> Result<Address, TokenError> {
         env.storage().instance().get(&DataKey::Admin).ok_or(TokenError::NotInitialized)
     }
