@@ -72,10 +72,54 @@ export async function withPoolRetry<T>(
   }
 }
 
+/**
+ * A dead-letter record for an event that could not be decoded or validated (#218). The raw
+ * payload, error message/stack and ledger sequence are persisted so the event can be inspected
+ * and retried from the admin CLI instead of crashing the indexer.
+ */
+export interface DlqEntry {
+  topic: string;
+  ledgerSequence: number;
+  rawPayload: unknown;
+  errorMessage: string;
+  errorStack: string | null;
+}
+
+/** Persists a failed event to the `indexer_dlq` table (#218). */
+export type DlqWriter = (entry: DlqEntry) => Promise<void>;
+
+/**
+ * Serializes an error into a DLQ entry (#218). Non-`Error` throws are stringified so the raw
+ * failure is never lost.
+ */
+export function toDlqEntry(event: RawContractEvent, error: unknown): DlqEntry {
+  const ledgerSequence =
+    typeof event.ledgerSequence === "number" ? event.ledgerSequence : 0;
+  if (error instanceof Error) {
+    return {
+      topic: event.topic,
+      ledgerSequence,
+      rawPayload: event.data,
+      errorMessage: error.message,
+      errorStack: error.stack ?? null,
+    };
+  }
+  return {
+    topic: event.topic,
+    ledgerSequence,
+    rawPayload: event.data,
+    errorMessage: String(error),
+    errorStack: null,
+  };
+}
+
 export class EventRouter {
   private readonly handlers = new Map<string, EventHandler>();
 
-  constructor(private readonly onUnmapped: UnmappedHandler) {}
+  constructor(
+    private readonly onUnmapped: UnmappedHandler,
+    private readonly dlqWriter?: DlqWriter,
+  ) {}
 
   /** Registers the handler for one topic. A topic can have only one handler. */
   register(topic: string, handler: EventHandler): void {
@@ -85,15 +129,26 @@ export class EventRouter {
     this.handlers.set(topic, handler);
   }
 
-  /** Routes one event to its handler. Returns `false` when no handler is registered. */
+  /**
+   * Routes one event to its handler. Returns `false` when no handler is registered. When a
+   * handler throws (decode/validation failure), the event is written to the DLQ and `false` is
+   * returned so a single bad event cannot crash the indexer (#218).
+   */
   async dispatchContractEvent(event: RawContractEvent): Promise<boolean> {
     const handler = this.handlers.get(event.topic);
     if (!handler) {
       this.onUnmapped(event);
       return false;
     }
-    await handler(event);
-    return true;
+    try {
+      await handler(event);
+      return true;
+    } catch (error) {
+      if (this.dlqWriter) {
+        await this.dlqWriter(toDlqEntry(event, error));
+      }
+      return false;
+    }
   }
 }
 
@@ -108,8 +163,9 @@ export function buildUserEventRouter(
     rewardPoints: EventHandler;
   },
   onUnmapped: UnmappedHandler,
+  dlqWriter?: DlqWriter,
 ): EventRouter {
-  const router = new EventRouter(onUnmapped);
+  const router = new EventRouter(onUnmapped, dlqWriter);
   router.register("claim", handlers.claim);
   router.register("fee_withdrawn", handlers.feeWithdrawn);
   router.register("reward_points", handlers.rewardPoints);
@@ -183,18 +239,26 @@ export function decodeTokenEvent(event: RawContractEvent): TokenEvent | null {
 /**
  * Builds the router with the IPREDICT token handlers wired in (#216): `transfer` and `mint`
  * events are decoded and handed to the caller-supplied ledger writer, which persists them to
- * the `token_transfers` table. Undecodable token events are reported via `onUnmapped`.
+ * the `token_transfers` table. Undecodable token events are written to the DLQ (#218) when a
+ * writer is supplied, otherwise reported via `onUnmapped`.
  */
 export function buildTokenEventRouter(
   handlers: {
     recordTokenEvent: (event: TokenEvent) => Promise<void>;
   },
   onUnmapped: UnmappedHandler,
+  dlqWriter?: DlqWriter,
 ): EventRouter {
-  const router = new EventRouter(onUnmapped);
+  const router = new EventRouter(onUnmapped, dlqWriter);
   const route = async (event: RawContractEvent): Promise<void> => {
     const decoded = decodeTokenEvent(event);
     if (!decoded) {
+      if (dlqWriter) {
+        await dlqWriter(
+          toDlqEntry(event, new Error(`malformed ${event.topic} event payload`)),
+        );
+        return;
+      }
       onUnmapped(event);
       return;
     }
