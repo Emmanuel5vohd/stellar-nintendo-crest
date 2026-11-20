@@ -6,16 +6,91 @@
  * so both run the same handler code. Topics with no handler are reported, not dropped.
  */
 
+import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import type { RawContractEvent } from "./event-schema";
 
 export type EventHandler = (event: RawContractEvent) => Promise<void>;
 
 export type UnmappedHandler = (event: RawContractEvent) => void;
 
+/**
+ * Prometheus metrics for the indexer (#214).
+ *
+ * Exposes the latest indexed ledger, the gap to the chain tip, and a per-topic ingestion
+ * duration histogram so operators can alert on lag and slow handlers. The registry is
+ * self-contained so it can be served from a `/metrics` route without touching globals.
+ */
+export class IndexerMetrics {
+  readonly registry = new Registry();
+  readonly latestLedger: Gauge<string>;
+  readonly chainTipLedger: Gauge<string>;
+  readonly lagLedgers: Gauge<string>;
+  readonly ingestionDuration: Histogram<string>;
+  readonly eventsProcessed: Counter<string>;
+
+  constructor() {
+    collectDefaultMetrics({ register: this.registry });
+    this.latestLedger = new Gauge({
+      name: "stellar_indexer_latest_ledger",
+      help: "Latest ledger sequence fully indexed by the indexer",
+      registers: [this.registry],
+    });
+    this.chainTipLedger = new Gauge({
+      name: "stellar_indexer_chain_tip_ledger",
+      help: "Latest ledger sequence observed at the Stellar chain tip",
+      registers: [this.registry],
+    });
+    this.lagLedgers = new Gauge({
+      name: "stellar_indexer_lag_ledgers",
+      help: "Number of ledgers the indexer is behind the chain tip",
+      registers: [this.registry],
+    });
+    this.ingestionDuration = new Histogram({
+      name: "stellar_indexer_event_ingestion_seconds",
+      help: "Contract event ingestion duration in seconds, per event topic",
+      labelNames: ["topic"],
+      buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5],
+      registers: [this.registry],
+    });
+    this.eventsProcessed = new Counter({
+      name: "stellar_indexer_events_processed_total",
+      help: "Total contract events processed, per event topic",
+      labelNames: ["topic"],
+      registers: [this.registry],
+    });
+  }
+
+  /** Records the latest indexed ledger and recomputes lag against the known chain tip. */
+  setLatestLedger(ledger: number): void {
+    this.latestLedger.set(ledger);
+    const tip = this.chainTipLedger.hashMap[""]?.value;
+    if (typeof tip === "number") {
+      this.lagLedgers.set(Math.max(0, tip - ledger));
+    }
+  }
+
+  /** Records the observed chain tip and recomputes lag against the latest indexed ledger. */
+  setChainTip(ledger: number): void {
+    this.chainTipLedger.set(ledger);
+    const latest = this.latestLedger.hashMap[""]?.value;
+    if (typeof latest === "number") {
+      this.lagLedgers.set(Math.max(0, ledger - latest));
+    }
+  }
+
+  /** Renders the registry in the Prometheus text exposition format for `/metrics`. */
+  async render(): Promise<string> {
+    return this.registry.metrics();
+  }
+}
+
 export class EventRouter {
   private readonly handlers = new Map<string, EventHandler>();
 
-  constructor(private readonly onUnmapped: UnmappedHandler) {}
+  constructor(
+    private readonly onUnmapped: UnmappedHandler,
+    private readonly metrics?: IndexerMetrics,
+  ) {}
 
   /** Registers the handler for one topic. A topic can have only one handler. */
   register(topic: string, handler: EventHandler): void {
@@ -32,8 +107,18 @@ export class EventRouter {
       this.onUnmapped(event);
       return false;
     }
-    await handler(event);
-    return true;
+    if (!this.metrics) {
+      await handler(event);
+      return true;
+    }
+    const end = this.metrics.ingestionDuration.startTimer({ topic: event.topic });
+    try {
+      await handler(event);
+      this.metrics.eventsProcessed.inc({ topic: event.topic });
+      return true;
+    } finally {
+      end();
+    }
   }
 }
 
@@ -48,8 +133,9 @@ export function buildUserEventRouter(
     rewardPoints: EventHandler;
   },
   onUnmapped: UnmappedHandler,
+  metrics?: IndexerMetrics,
 ): EventRouter {
-  const router = new EventRouter(onUnmapped);
+  const router = new EventRouter(onUnmapped, metrics);
   router.register("claim", handlers.claim);
   router.register("fee_withdrawn", handlers.feeWithdrawn);
   router.register("reward_points", handlers.rewardPoints);
@@ -136,6 +222,7 @@ export async function runCatchUp(
   checkpoints: CheckpointStore,
   options: CatchUpOptions,
   deploymentSequence: number,
+  metrics?: IndexerMetrics,
 ): Promise<{ lastLedger: number }> {
   const fromLedger = options.fromLedger ?? deploymentSequence;
   const toLedger = options.toLedger ?? fromLedger;
@@ -155,6 +242,8 @@ export async function runCatchUp(
     cursor = page.cursor;
     lastLedger = toLedger;
     await checkpoints.save(cursor, lastLedger);
+    metrics?.setChainTip(toLedger);
+    metrics?.setLatestLedger(lastLedger);
     if (cursor === null) {
       break;
     }
