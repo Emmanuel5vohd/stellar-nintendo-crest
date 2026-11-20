@@ -70,6 +70,11 @@ export const indexerErrorsTotal = define("indexer_errors_total", "Indexer errors
 export const indexerUnmappedEventsTotal = define("indexer_unmapped_events_total", "Contract events with no handler.", "counter");
 export const stellarTxConfirmationSeconds = define("stellar_tx_confirmation_seconds", "Stellar transaction confirmation latency in seconds.", "gauge");
 
+/** Sequence continuity (#215): detected gaps and unresolved critical gaps. */
+export const indexerSequenceGapsTotal = define("indexer_sequence_gaps_total", "Ledger sequence gaps detected during ingestion.", "counter");
+export const indexerSequenceGapUnresolvedTotal = define("indexer_sequence_gap_unresolved_total", "Ledger sequence gaps that could not be resolved within the retry budget.", "counter");
+export const indexerSequenceGapRetriesTotal = define("indexer_sequence_gap_retries_total", "Retry attempts made to fetch missed ledger sequences.", "counter");
+
 export const pgPoolActiveConnections = define("pg_pool_active_connections", "Number of active connections.", "gauge");
 export const pgPoolIdleConnections = define("pg_pool_idle_connections", "Number of idle connections.", "gauge");
 export const pgPoolWaitingQueries = define("pg_pool_waiting_queries", "Number of queries waiting for a connection.", "gauge");
@@ -123,6 +128,21 @@ export function updateLedgerLag(currentLedger: number, chainHeadLedger: number):
   setGauge(indexerCurrentLedger, currentLedger);
   setGauge(indexerChainHeadLedger, chainHeadLedger);
   setGauge(indexerLagLedgers, Math.max(0, chainHeadLedger - currentLedger));
+}
+
+/** Records a detected ledger sequence gap (#215). */
+export function recordSequenceGap(expected: number, received: number): void {
+  incCounter(indexerSequenceGapsTotal, 1, { expected: String(expected), received: String(received) });
+}
+
+/** Records a retry attempt to fetch a missed ledger sequence (#215). */
+export function recordSequenceGapRetry(sequence: number, attempt: number): void {
+  incCounter(indexerSequenceGapRetriesTotal, 1, { sequence: String(sequence), attempt: String(attempt) });
+}
+
+/** Records a gap that could not be resolved within the retry budget (#215). */
+export function recordSequenceGapUnresolved(sequence: number): void {
+  incCounter(indexerSequenceGapUnresolvedTotal, 1, { sequence: String(sequence) });
 }
 
 function formatLabels(labels: Labels): string {
