@@ -40,6 +40,66 @@ export function aggregateOutcomes(answers: Outcome[], options: AggregateOptions 
 }
 
 /**
+ * Redis-backed response cache (#229).
+ *
+ * External price and sports providers rate-limit aggressively, so every upstream query is
+ * memoized in Redis with a short TTL. Cache keys are deterministic (provider + query params)
+ * and any Redis failure degrades gracefully to a direct upstream fetch.
+ */
+
+/** Minimal Redis surface the cache needs; compatible with ioredis / node-redis clients. */
+export interface RedisLike {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, mode: "EX", ttlSeconds: number): Promise<unknown>;
+}
+
+/** TTL for real-time price queries. */
+export const PRICE_CACHE_TTL_SECONDS = 10;
+/** TTL for sports game status queries. */
+export const SPORTS_CACHE_TTL_SECONDS = 60;
+
+/** Builds a deterministic cache key from a provider id and its query parameters. */
+export function buildCacheKey(provider: string, params: Record<string, string | number | undefined>): string {
+  const parts = Object.keys(params)
+    .filter((k) => params[k] !== undefined)
+    .sort()
+    .map((k) => `${k}=${encodeURIComponent(String(params[k]))}`);
+  return `oracle:cache:${provider}:${parts.join("&")}`;
+}
+
+/**
+ * Returns the cached JSON value for `key`, or runs `fetcher` and caches its result for `ttlSeconds`.
+ * Redis read/write errors are swallowed so callers always fall back to a direct fetch.
+ */
+export async function cachedFetch<T>(
+  redis: RedisLike | undefined,
+  key: string,
+  ttlSeconds: number,
+  fetcher: () => Promise<T>,
+): Promise<T> {
+  if (redis) {
+    try {
+      const hit = await redis.get(key);
+      if (hit !== null) return JSON.parse(hit) as T;
+    } catch {
+      // cache read failed — fall through to a direct fetch
+    }
+  }
+
+  const value = await fetcher();
+
+  if (redis) {
+    try {
+      await redis.set(key, JSON.stringify(value), "EX", ttlSeconds);
+    } catch {
+      // cache write failed — the fetched value is still returned
+    }
+  }
+
+  return value;
+}
+
+/**
  * Sports outcome resolution (#228).
  *
  * Resolves professional sports / esports games (EPL, NBA, NFL, ...) into a binary market
@@ -131,23 +191,27 @@ export class SportsradarAdapter implements SportsDataProvider {
     private readonly apiKey: string,
     private readonly baseUrl = "https://api.sportradar.com",
     private readonly fetchImpl: typeof fetch = fetch,
+    private readonly redis?: RedisLike,
   ) {}
 
   async getGameState(gameId: string): Promise<GameState> {
-    const url = `${this.baseUrl}/schedules/${encodeURIComponent(gameId)}/summary.json?api_key=${encodeURIComponent(this.apiKey)}`;
-    const res = await this.fetchImpl(url);
-    if (!res.ok) throw new Error(`sportsradar request failed: ${res.status}`);
-    const body = (await res.json()) as {
-      status?: string;
-      home?: { points?: number };
-      away?: { points?: number };
-    };
-    return {
-      gameId,
-      status: mapSportsradarStatus(body.status),
-      homeScore: body.home?.points,
-      awayScore: body.away?.points,
-    };
+    const key = buildCacheKey(this.name, { gameId });
+    return cachedFetch(this.redis, key, SPORTS_CACHE_TTL_SECONDS, async () => {
+      const url = `${this.baseUrl}/schedules/${encodeURIComponent(gameId)}/summary.json?api_key=${encodeURIComponent(this.apiKey)}`;
+      const res = await this.fetchImpl(url);
+      if (!res.ok) throw new Error(`sportsradar request failed: ${res.status}`);
+      const body = (await res.json()) as {
+        status?: string;
+        home?: { points?: number };
+        away?: { points?: number };
+      };
+      return {
+        gameId,
+        status: mapSportsradarStatus(body.status),
+        homeScore: body.home?.points,
+        awayScore: body.away?.points,
+      };
+    });
   }
 }
 
@@ -181,27 +245,31 @@ export class TheRundownAdapter implements SportsDataProvider {
     private readonly sport: string,
     private readonly baseUrl = "https://therundown-therundown-v1.p.rapidapi.com",
     private readonly fetchImpl: typeof fetch = fetch,
+    private readonly redis?: RedisLike,
   ) {}
 
   async getGameState(gameId: string): Promise<GameState> {
-    const url = `${this.baseUrl}/sports/${encodeURIComponent(this.sport)}/events/${encodeURIComponent(gameId)}`;
-    const res = await this.fetchImpl(url, {
-      headers: { "X-RapidAPI-Key": this.apiKey },
-    });
-    if (!res.ok) throw new Error(`therundown request failed: ${res.status}`);
-    const body = (await res.json()) as {
-      event?: {
-        status?: string;
-        score?: { event_score_home?: number; event_score_away?: number };
+    const key = buildCacheKey(this.name, { sport: this.sport, gameId });
+    return cachedFetch(this.redis, key, SPORTS_CACHE_TTL_SECONDS, async () => {
+      const url = `${this.baseUrl}/sports/${encodeURIComponent(this.sport)}/events/${encodeURIComponent(gameId)}`;
+      const res = await this.fetchImpl(url, {
+        headers: { "X-RapidAPI-Key": this.apiKey },
+      });
+      if (!res.ok) throw new Error(`therundown request failed: ${res.status}`);
+      const body = (await res.json()) as {
+        event?: {
+          status?: string;
+          score?: { event_score_home?: number; event_score_away?: number };
+        };
       };
-    };
-    const event = body.event ?? {};
-    return {
-      gameId,
-      status: mapTheRundownStatus(event.status),
-      homeScore: event.score?.event_score_home,
-      awayScore: event.score?.event_score_away,
-    };
+      const event = body.event ?? {};
+      return {
+        gameId,
+        status: mapTheRundownStatus(event.status),
+        homeScore: event.score?.event_score_home,
+        awayScore: event.score?.event_score_away,
+      };
+    });
   }
 }
 
@@ -234,31 +302,7 @@ export class MockSportsAdapter implements SportsDataProvider {
 
   async getGameState(gameId: string): Promise<GameState> {
     const game = this.games[gameId];
-    if (!game) throw new Error(`mock game not found: ${gameId}`);
+    if (!game) throw new Error(`unknown mock game: ${gameId}`);
     return game;
   }
-}
-
-/**
- * Resolves a sports market by querying every provider and running the answers through the
- * N-of-M consensus gate. Providers that error or disagree cause escalation.
- */
-export async function resolveSportsMarket(
-  providers: SportsDataProvider[],
-  gameId: string,
-  terms: SportsMarketTerms,
-  options: AggregateOptions = {},
-): Promise<AggregateResult | { status: "void"; reason: string }> {
-  const answers: Outcome[] = [];
-  for (const provider of providers) {
-    try {
-      const game = await provider.getGameState(gameId);
-      const resolution = resolveSportsOutcome(game, terms);
-      if (resolution.status === "void") return { status: "void", reason: resolution.reason };
-      if (resolution.status === "resolved") answers.push(resolution.outcome);
-    } catch {
-      // A failing provider simply does not contribute an answer.
-    }
-  }
-  return aggregateOutcomes(answers, options);
 }
