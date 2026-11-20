@@ -72,3 +72,39 @@ export function parseEventsOrDeadLetter(
   }
   return valid;
 }
+
+/**
+ * Computes a deterministic event hash from `(ledger_sequence, tx_hash, event_index)` (#220).
+ *
+ * The same on-chain event always yields the same hash, so a restart that re-reads a partially
+ * processed ledger produces identical hashes. Persisting this value in a `UNIQUE` column and
+ * inserting with `ON CONFLICT DO NOTHING` makes writes idempotent: duplicate bet rows and
+ * inflated pool totals are prevented at the database level.
+ *
+ * Uses FNV-1a (64-bit) so the hash is stable across processes and needs no crypto dependency.
+ */
+export function computeEventHash(
+  ledgerSequence: number,
+  txHash: string,
+  eventIndex: number,
+): string {
+  const input = `${ledgerSequence}:${txHash}:${eventIndex}`;
+  // FNV-1a 64-bit constants.
+  const FNV_OFFSET = 0xcbf29ce484222325n;
+  const FNV_PRIME = 0x100000001b3n;
+  const MASK = 0xffffffffffffffffn;
+
+  let hash = FNV_OFFSET;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = (hash * FNV_PRIME) & MASK;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+/**
+ * Convenience wrapper: derives the event hash for a validated raw event.
+ */
+export function eventHashFor(event: RawContractEvent): string {
+  return computeEventHash(event.ledger, event.txHash, event.eventIndex);
+}
