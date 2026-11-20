@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, String};
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -12,6 +12,8 @@ pub enum TokenError {
     InsufficientBalance = 4,
     InvalidAmount       = 5,
     NotAdmin            = 6,
+    SignatureExpired    = 7,
+    InvalidSignature    = 8,
 }
 
 #[contracttype]
@@ -24,6 +26,7 @@ pub enum DataKey {
     Name,
     Symbol,
     Decimals,
+    OracleMaxAge,
 }
 
 #[contract]
@@ -198,6 +201,49 @@ impl IPredictTokenContract {
         } else {
             decayed
         }
+    }
+
+    /// Configure the maximum age (in seconds) an oracle signature may have (#202).
+    /// Admin only. Defaults to 300s when unset.
+    pub fn set_oracle_max_age(env: Env, max_age: u64) -> Result<(), TokenError> {
+        let admin: Address = Self::require_admin(&env)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::OracleMaxAge, &max_age);
+        Ok(())
+    }
+
+    /// Verify an Ed25519 signature over an oracle submission payload (#202).
+    ///
+    /// The signed message is the canonical encoding of
+    /// `(market_id, outcome, timestamp)`. Signatures older than the configured
+    /// max-age threshold are rejected. On success an `OracleSignatureVerified`
+    /// telemetry event is emitted.
+    pub fn verify_oracle_signature(
+        env: Env,
+        market_id: u64,
+        outcome: u32,
+        timestamp: u64,
+        signature: BytesN<64>,
+        pubkey: BytesN<32>,
+    ) -> Result<(), TokenError> {
+        let max_age: u64 = env.storage().instance().get(&DataKey::OracleMaxAge).unwrap_or(300);
+        let now = env.ledger().timestamp();
+        if timestamp > now || now.saturating_sub(timestamp) > max_age {
+            return Err(TokenError::SignatureExpired);
+        }
+
+        let mut msg = Bytes::new(&env);
+        msg.extend_from_array(&market_id.to_be_bytes());
+        msg.extend_from_array(&outcome.to_be_bytes());
+        msg.extend_from_array(&timestamp.to_be_bytes());
+
+        env.crypto().ed25519_verify(&pubkey, &msg, &signature);
+
+        env.events().publish(
+            (String::from_str(&env, "oracle"), String::from_str(&env, "OracleSignatureVerified")),
+            (market_id, outcome, timestamp, pubkey),
+        );
+        Ok(())
     }
 
     fn require_admin(env: &Env) -> Result<Address, TokenError> {
