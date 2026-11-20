@@ -12,6 +12,66 @@ export type EventHandler = (event: RawContractEvent) => Promise<void>;
 
 export type UnmappedHandler = (event: RawContractEvent) => void;
 
+/**
+ * PostgreSQL pool tuning for the indexer runner (#217). Bursts of hundreds of concurrent bet
+ * events otherwise exhaust the pool and time out queries, so the pool is bounded and every
+ * statement is capped.
+ */
+export interface PoolConfig {
+  min: number;
+  max: number;
+  statementTimeoutMs: number;
+  idleTimeoutMs: number;
+}
+
+export const DEFAULT_POOL_CONFIG: PoolConfig = {
+  min: 5,
+  max: 30,
+  statementTimeoutMs: 5000,
+  idleTimeoutMs: 10000,
+};
+
+/**
+ * Runs `work` against a pooled connection and always releases it (#217). The `finally` block
+ * guarantees release even when the handler throws, so a failing event cannot leak a connection.
+ */
+export async function withPooledConnection<T>(
+  acquire: () => Promise<T>,
+  release: (connection: T) => void,
+  work: (connection: T) => Promise<void>,
+): Promise<void> {
+  const connection = await acquire();
+  try {
+    await work(connection);
+  } finally {
+    release(connection);
+  }
+}
+
+/**
+ * Retries `work` with exponential backoff when the pool is saturated (#217). Transient pool
+ * exhaustion is retried a bounded number of times; any other error is rethrown immediately.
+ */
+export async function withPoolRetry<T>(
+  work: () => Promise<T>,
+  isPoolExhausted: (error: unknown) => boolean,
+  maxAttempts = 5,
+  baseDelayMs = 50,
+): Promise<T> {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await work();
+    } catch (error) {
+      attempt += 1;
+      if (attempt >= maxAttempts || !isPoolExhausted(error)) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** (attempt - 1)));
+    }
+  }
+}
+
 export class EventRouter {
   private readonly handlers = new Map<string, EventHandler>();
 
