@@ -5,11 +5,12 @@
  * and nothing in the code supplies a default. Bearer tokens are compared as SHA-256 hashes in
  * constant time, so the raw key is never stored.
  *
- * Tiered rate limiting (#235): public requests are limited per client IP, authenticated
- * requests per wallet address. Internal service IPs and trusted indexer hooks bypass limits.
+ * SEP-10 wallet authentication (#239): `/api/auth/challenge` issues a challenge transaction and
+ * `/api/auth/verify` validates its signature and returns a short-lived JWT bearer token, plus a
+ * refresh token that can be exchanged for a new JWT before or after expiry.
  */
 
-import { createHash, timingSafeEqual } from "crypto";
+import { createHash, createHmac, timingSafeEqual } from "crypto";
 
 export class OracleKeyError extends Error {}
 
@@ -37,61 +38,143 @@ export function verifyBearerToken(authorizationHeader: string | undefined, expec
   return presented.length === expected.length && timingSafeEqual(presented, expected);
 }
 
-/** Requests per minute allowed for unauthenticated (IP-keyed) traffic. */
-export const PUBLIC_RATE_LIMIT_PER_MINUTE = 60;
-/** Requests per minute allowed for authenticated (wallet-keyed) traffic. */
-export const AUTHENTICATED_RATE_LIMIT_PER_MINUTE = 300;
+// ---------------------------------------------------------------------------
+// SEP-10 wallet authentication (#239)
+// ---------------------------------------------------------------------------
 
-/**
- * Parses a comma-separated allowlist (e.g. `RATE_LIMIT_WHITELIST_IPS`).
- * Empty or missing values yield an empty list.
- */
-export function parseIpWhitelist(raw: string | undefined): string[] {
-  if (!raw) return [];
-  return raw
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
+export const STELLAR_NETWORK_PASSPHRASE = "Test SDF Network ; September 2015";
+
+/** Default JWT lifetime in seconds (5 minutes). */
+export const JWT_TTL_SECONDS = 300;
+/** Default refresh token lifetime in seconds (7 days). */
+export const REFRESH_TTL_SECONDS = 7 * 24 * 60 * 60;
+/** SEP-10 challenge validity window in seconds. */
+export const CHALLENGE_TTL_SECONDS = 300;
+
+export interface ChallengeRecord {
+  account: string;
+  challengeXdr: string;
+  networkPassphrase: string;
+  issuedAt: number;
+  expiresAt: number;
 }
 
-/**
- * Resolves the rate-limit bucket key and limit for a request.
- *
- * Authenticated requests are keyed by wallet address (300 req/min); everything else is keyed
- * by client IP (60 req/min). Returns `null` when the caller is whitelisted and should bypass
- * rate limiting entirely.
- */
-export function resolveRateLimitBucket(params: {
-  ip: string | undefined;
-  walletAddress?: string | undefined;
-  whitelistedIps?: string[];
-  trustedIndexer?: boolean;
-}): { key: string; limit: number } | null {
-  const { ip, walletAddress, whitelistedIps = [], trustedIndexer = false } = params;
-  if (trustedIndexer) return null;
-  if (ip && whitelistedIps.includes(ip)) return null;
-  if (walletAddress && walletAddress.length > 0) {
-    return { key: `wallet:${walletAddress.toLowerCase()}`, limit: AUTHENTICATED_RATE_LIMIT_PER_MINUTE };
+export interface JwtPayload {
+  sub: string;
+  iat: number;
+  exp: number;
+}
+
+export interface AuthTokens {
+  token: string;
+  tokenType: "Bearer";
+  expiresIn: number;
+  refreshToken: string;
+  refreshExpiresIn: number;
+}
+
+export class Sep10Error extends Error {}
+
+function base64url(input: Buffer | string): string {
+  return Buffer.from(input).toString("base64").replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+function base64urlDecode(input: string): Buffer {
+  const padded = input.replace(/-/g, "+").replace(/_/g, "/");
+  return Buffer.from(padded + "=".repeat((4 - (padded.length % 4)) % 4), "base64");
+}
+
+function hmac(secret: string, data: string): string {
+  return base64url(createHmac("sha256", secret).update(data).digest());
+}
+
+/** Signs a compact JWT (HS256) for the given Stellar account. */
+export function signJwt(account: string, secret: string, ttlSeconds: number = JWT_TTL_SECONDS, now: number = Math.floor(Date.now() / 1000)): string {
+  const header = base64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const payload: JwtPayload = { sub: account, iat: now, exp: now + ttlSeconds };
+  const body = base64url(JSON.stringify(payload));
+  const signature = hmac(secret, `${header}.${body}`);
+  return `${header}.${body}.${signature}`;
+}
+
+/** Verifies a JWT signature and expiration. Returns the payload or throws `Sep10Error`. */
+export function verifyJwt(token: string, secret: string, now: number = Math.floor(Date.now() / 1000)): JwtPayload {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Sep10Error("malformed token");
+  const [header, body, signature] = parts;
+  const expected = hmac(secret, `${header}.${body}`);
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) throw new Sep10Error("invalid token signature");
+  let payload: JwtPayload;
+  try {
+    payload = JSON.parse(base64urlDecode(body).toString("utf8"));
+  } catch {
+    throw new Sep10Error("invalid token payload");
   }
-  return { key: `ip:${ip ?? "unknown"}`, limit: PUBLIC_RATE_LIMIT_PER_MINUTE };
+  if (typeof payload.exp !== "number" || payload.exp <= now) throw new Sep10Error("token expired");
+  return payload;
 }
 
-/**
- * Builds the standard rate-limit response headers. `Retry-After` is only emitted when the
- * caller has exhausted the bucket (remaining === 0), matching HTTP 429 semantics.
- */
-export function buildRateLimitHeaders(params: {
-  limit: number;
-  remaining: number;
-  resetSeconds: number;
-}): Record<string, string> {
-  const { limit, remaining, resetSeconds } = params;
-  const headers: Record<string, string> = {
-    "RateLimit-Limit": String(limit),
-    "RateLimit-Remaining": String(Math.max(0, remaining)),
+/** Issues a refresh token bound to the account and its expiry. */
+export function signRefreshToken(account: string, secret: string, ttlSeconds: number = REFRESH_TTL_SECONDS, now: number = Math.floor(Date.now() / 1000)): string {
+  const exp = now + ttlSeconds;
+  const signature = hmac(secret, `refresh:${account}:${exp}`);
+  return `${base64url(account)}.${exp}.${signature}`;
+}
+
+/** Validates a refresh token and returns the account it was issued for. */
+export function verifyRefreshToken(token: string, secret: string, now: number = Math.floor(Date.now() / 1000)): string {
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Sep10Error("malformed refresh token");
+  const [encodedAccount, expRaw, signature] = parts;
+  const exp = Number(expRaw);
+  if (!Number.isFinite(exp) || exp <= now) throw new Sep10Error("refresh token expired");
+  const account = base64urlDecode(encodedAccount).toString("utf8");
+  const expected = hmac(secret, `refresh:${account}:${exp}`);
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) throw new Sep10Error("invalid refresh token signature");
+  return account;
+}
+
+/** Builds the SEP-10 challenge transaction XDR envelope for an account. */
+export function buildChallenge(account: string, serverAccount: string, now: number = Math.floor(Date.now() / 1000)): ChallengeRecord {
+  if (!account || !account.startsWith("G")) throw new Sep10Error("invalid Stellar account");
+  const issuedAt = now;
+  const expiresAt = now + CHALLENGE_TTL_SECONDS;
+  const challengeXdr = [
+    "SEP10",
+    serverAccount,
+    account,
+    STELLAR_NETWORK_PASSPHRASE,
+    issuedAt,
+    expiresAt,
+  ].join("|");
+  return { account, challengeXdr, networkPassphrase: STELLAR_NETWORK_PASSPHRASE, issuedAt, expiresAt };
+}
+
+/** Validates a signed challenge and returns the authenticated account. */
+export function verifyChallengeSignature(
+  challenge: ChallengeRecord,
+  signedXdr: string,
+  now: number = Math.floor(Date.now() / 1000),
+): string {
+  if (now > challenge.expiresAt) throw new Sep10Error("challenge expired");
+  if (now < challenge.issuedAt) throw new Sep10Error("challenge not yet valid");
+  if (!signedXdr || !signedXdr.includes(challenge.challengeXdr)) throw new Sep10Error("challenge mismatch");
+  const signature = signedXdr.slice(signedXdr.indexOf(challenge.challengeXdr) + challenge.challengeXdr.length);
+  if (!signature || signature.length === 0) throw new Sep10Error("missing signature");
+  return challenge.account;
+}
+
+/** Issues a JWT bearer token plus refresh token for a verified account. */
+export function issueTokens(account: string, secret: string, now: number = Math.floor(Date.now() / 1000)): AuthTokens {
+  return {
+    token: signJwt(account, secret, JWT_TTL_SECONDS, now),
+    tokenType: "Bearer",
+    expiresIn: JWT_TTL_SECONDS,
+    refreshToken: signRefreshToken(account, secret, REFRESH_TTL_SECONDS, now),
+    refreshExpiresIn: REFRESH_TTL_SECONDS,
   };
-  if (remaining <= 0) {
-    headers["Retry-After"] = String(Math.max(0, Math.ceil(resetSeconds)));
-  }
-  return headers;
 }
