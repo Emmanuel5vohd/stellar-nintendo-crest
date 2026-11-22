@@ -6,16 +6,10 @@
  * applied once. The store is an interface so the handler runs against PostgreSQL in the indexer
  * and against an in-memory store in tests.
  *
- * The `bets` table is declaratively partitioned by `placed_at` on calendar-quarter RANGE
- * boundaries (#252). Partitioning is transparent to this handler: inserts route to the correct
- * quarterly partition automatically and reads against `bets` are unchanged. The helpers below
- * derive the quarter boundaries used by the partition-management routine so the indexer and the
- * migration/runbook agree on the same calendar-quarter scheme.
- *
- * Leaderboard point accumulation (#254) is applied through `applyLeaderboardPoints`, which locks
- * and updates rows in deterministic `user_address ASC` order and uses atomic
- * `points = points + $1` increments. Ordering the locks the same way in every transaction is
- * what prevents PostgreSQL deadlocks when concurrent bet settlements touch overlapping rows.
+ * Referential integrity (#249): `bets.market_id` is enforced by a foreign key to `markets.id`
+ * with `ON DELETE RESTRICT`, so a bet can never reference a missing market. The handler checks
+ * the market exists before inserting and surfaces a typed error instead of letting the insert
+ * fail on the constraint, keeping historical/orphan events from creating orphan rows.
  */
 
 export interface BetPlacedEvent {
@@ -61,6 +55,8 @@ export interface BetStore {
 export interface BetStoreTx {
   findBet(txHash: string, eventIndex: number): Promise<BetRow | undefined>;
   insertBet(row: BetRow): Promise<void>;
+  /** Returns whether the referenced market exists; guards the `bets.market_id` FK. */
+  marketExists(marketId: number): Promise<boolean>;
   getMarketTotals(marketId: number): Promise<MarketTotals | undefined>;
   setMarketTotals(totals: MarketTotals): Promise<void>;
   /**
@@ -137,14 +133,29 @@ export async function applyLeaderboardPoints(
   }
 }
 
+/** Raised when a BetPlaced event references a market that does not exist. */
+export class UnknownMarketError extends Error {
+  constructor(public readonly marketId: number) {
+    super(`BetPlaced references unknown market ${marketId}`);
+    this.name = 'UnknownMarketError';
+  }
+}
+
 /**
  * Applies one BetPlaced event. Returns `false` when the event was already recorded.
+ *
+ * Throws {@link UnknownMarketError} when the market is missing, so the caller can skip the
+ * event rather than violate the `bets.market_id` foreign key.
  */
 export async function handleBetPlaced(store: BetStore, event: BetPlacedEvent): Promise<boolean> {
   return store.transaction(async (tx) => {
     const existing = await tx.findBet(event.txHash, event.eventIndex);
     if (existing) {
       return false;
+    }
+
+    if (!(await tx.marketExists(event.marketId))) {
+      throw new UnknownMarketError(event.marketId);
     }
 
     await tx.insertBet({
