@@ -1112,3 +1112,49 @@ fn test_council_vote_events() {
     assert_eq!(timelock_deadline, t.env.ledger().timestamp() + 86_400);
 }
 
+#[test]
+fn test_resolve_empty_market_zero_bets() {
+    let t = setup();
+    let market_id = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Zero bet market?"),
+        &String::from_str(&t.env, "https://icon.png"),
+        &Category::Crypto,
+        &3600_u64,
+    );
+
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &market_id, &true);
+
+    let m = t.client.get_market(&market_id);
+    assert!(m.resolved);
+    assert_eq!(m.total_yes, 0);
+    assert_eq!(m.total_no, 0);
+}
+
+#[test]
+fn test_one_sided_market_claim_no_panic() {
+    let t = setup();
+    let alice = Address::generate(&t.env);
+    t.xlm.mint(&alice, &1000_0000000);
+
+    let market_id = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "One sided market?"),
+        &String::from_str(&t.env, "https://icon.png"),
+        &Category::Crypto,
+        &3600_u64,
+    );
+
+    // Only YES bet placed
+    t.client.place_bet(&alice, &market_id, &true, &100_0000000_i128);
+
+    advance_time(&t.env, 3601);
+    t.client.resolve_market(&t.admin, &market_id, &true);
+
+    // Claim should succeed without division by zero panic
+    t.client.claim(&alice, &market_id);
+    let pos = t.client.get_position(&market_id, &alice);
+    assert!(pos.claimed);
+}
+
