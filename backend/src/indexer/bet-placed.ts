@@ -41,6 +41,12 @@ export interface MarketTotals {
   betCount: number;
 }
 
+/** One leaderboard point delta for a user address. */
+export interface LeaderboardPointDelta {
+  userAddress: string;
+  points: bigint;
+}
+
 export interface BetStore {
   /** Runs `work` in one transaction; every write in it commits or none does. */
   transaction<T>(work: (tx: BetStoreTx) => Promise<T>): Promise<T>;
@@ -53,6 +59,78 @@ export interface BetStoreTx {
   marketExists(marketId: number): Promise<boolean>;
   getMarketTotals(marketId: number): Promise<MarketTotals | undefined>;
   setMarketTotals(totals: MarketTotals): Promise<void>;
+  /**
+   * Atomically adds `points` to `userAddress`'s leaderboard score
+   * (`UPDATE ... SET points = points + $1`), inserting the row when absent (UPSERT).
+   */
+  incrementLeaderboardPoints(userAddress: string, points: bigint): Promise<void>;
+}
+
+/**
+ * Calendar-quarter partition descriptor for the `bets` table (#252).
+ *
+ * `name` is the child partition table name (e.g. `bets_2026_q1`) and `[start, end)` is the
+ * half-open `placed_at` range it covers, matching PostgreSQL RANGE partition bounds.
+ */
+export interface BetPartition {
+  name: string;
+  start: Date;
+  end: Date;
+}
+
+/**
+ * Returns the calendar-quarter partition that covers `date`.
+ *
+ * Quarters are calendar-aligned: Q1 = Jan–Mar, Q2 = Apr–Jun, Q3 = Jul–Sep, Q4 = Oct–Dec. The
+ * returned range is half-open (`start` inclusive, `end` exclusive) so adjacent partitions never
+ * overlap, which is required for PostgreSQL RANGE partitioning.
+ */
+export function betPartitionFor(date: Date): BetPartition {
+  const year = date.getUTCFullYear();
+  const quarter = Math.floor(date.getUTCMonth() / 3) + 1;
+  const startMonth = (quarter - 1) * 3;
+  const start = new Date(Date.UTC(year, startMonth, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(year, startMonth + 3, 1, 0, 0, 0, 0));
+  return { name: `bets_${year}_q${quarter}`, start, end };
+}
+
+/**
+ * Returns the next `count` calendar-quarter partitions starting at the quarter containing
+ * `from`. Used by the partition-management routine to pre-provision upcoming quarters so inserts
+ * never fail on a missing partition.
+ */
+export function upcomingBetPartitions(from: Date, count: number): BetPartition[] {
+  const partitions: BetPartition[] = [];
+  let cursor = betPartitionFor(from).start;
+  for (let i = 0; i < count; i += 1) {
+    const partition = betPartitionFor(cursor);
+    partitions.push(partition);
+    cursor = partition.end;
+  }
+  return partitions;
+}
+
+/**
+ * Applies leaderboard point deltas inside an open transaction (#254).
+ *
+ * Deltas are sorted by `userAddress ASC` before any row is locked/updated so every concurrent
+ * transaction acquires row locks in the same global order, which eliminates the classic
+ * PostgreSQL deadlock caused by two transactions updating the same rows in opposite orders.
+ * Each row is then incremented atomically (`points = points + $1`) rather than read-modify-write.
+ */
+export async function applyLeaderboardPoints(
+  tx: BetStoreTx,
+  deltas: readonly LeaderboardPointDelta[],
+): Promise<void> {
+  const ordered = [...deltas].sort((a, b) =>
+    a.userAddress < b.userAddress ? -1 : a.userAddress > b.userAddress ? 1 : 0,
+  );
+  for (const delta of ordered) {
+    if (delta.points === 0n) {
+      continue;
+    }
+    await tx.incrementLeaderboardPoints(delta.userAddress, delta.points);
+  }
 }
 
 /** Raised when a BetPlaced event references a market that does not exist. */
@@ -103,6 +181,10 @@ export async function handleBetPlaced(store: BetStore, event: BetPlacedEvent): P
       totalNo: current.totalNo + (event.isYes ? 0n : event.netAmount),
       betCount: current.betCount + 1,
     });
+
+    await applyLeaderboardPoints(tx, [
+      { userAddress: event.bettor, points: event.netAmount },
+    ]);
 
     return true;
   });
