@@ -12,14 +12,16 @@ pub enum TokenError {
     InsufficientBalance = 4,
     InvalidAmount       = 5,
     NotAdmin            = 6,
-    NoVestingSchedule   = 7,
-    NothingToClaim      = 8,
+    /// Caller is not the registered market contract address.
+    UnauthorizedCaller  = 7,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
+    /// The one market contract address allowed to call `mint_rewards`.
+    MarketContract,
     AuthorizedMinter(Address),
     Balance(Address),
     TotalSupply,
@@ -72,6 +74,49 @@ impl IPredictTokenContract {
         if admin != stored { return Err(TokenError::NotAdmin); }
         admin.require_auth();
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    /// Register the one market contract address permitted to call `mint_rewards`.
+    /// Only the admin can set this. Replaces any previously stored address.
+    pub fn set_market_contract(env: Env, admin: Address, market: Address) -> Result<(), TokenError> {
+        let stored: Address = env.storage().instance().get(&DataKey::Admin)
+            .ok_or(TokenError::NotInitialized)?;
+        if admin != stored { return Err(TokenError::NotAdmin); }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::MarketContract, &market);
+        Ok(())
+    }
+
+    /// Returns the registered market contract address, if any.
+    pub fn get_market_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::MarketContract)
+    }
+
+    /// Mint tokens as a reward from the market contract.
+    ///
+    /// This entry-point is restricted to the address stored as `MarketContract`.
+    /// The check is enforced via `env.current_contract_address()` authorization
+    /// semantics: the caller must be the exact address stored at initialization
+    /// time, so direct external calls or calls from any other contract address
+    /// are rejected with `UnauthorizedCaller` before any state is mutated.
+    ///
+    /// Unlike the general `mint` (which accepts any `AuthorizedMinter`), this
+    /// function provides a named, narrowly-scoped entry-point to prevent
+    /// unauthorized token minting from external callers.
+    pub fn mint_rewards(env: Env, caller: Address, to: Address, amount: i128) -> Result<(), TokenError> {
+        if amount <= 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        // `caller` must be the stored market contract — rejects any external
+        // address that is not the registered market contract.
+        caller.require_auth();
+        Self::require_market_contract(&env, &caller)?;
+
+        let balance = Self::balance(env.clone(), to.clone());
+        env.storage().persistent().set(&DataKey::Balance(to), &(balance + amount));
+        let supply: i128 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalSupply, &(supply + amount));
         Ok(())
     }
 
@@ -263,6 +308,19 @@ impl IPredictTokenContract {
 
     fn require_admin(env: &Env) -> Result<Address, TokenError> {
         env.storage().instance().get(&DataKey::Admin).ok_or(TokenError::NotInitialized)
+    }
+
+    /// Verifies that `caller` matches the stored `MarketContract` address.
+    /// Returns `UnauthorizedCaller` if the market contract has not been set
+    /// or if `caller` does not match the registered address.
+    fn require_market_contract(env: &Env, caller: &Address) -> Result<(), TokenError> {
+        let market: Address = env.storage().instance()
+            .get(&DataKey::MarketContract)
+            .ok_or(TokenError::UnauthorizedCaller)?;
+        if *caller != market {
+            return Err(TokenError::UnauthorizedCaller);
+        }
+        Ok(())
     }
 }
 
