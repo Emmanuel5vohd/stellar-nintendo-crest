@@ -1,6 +1,8 @@
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
+const crypto = require('crypto');
+const { Keypair, Networks, TransactionBuilder, Transaction, Operation, Account, BASE_FEE } = require('@stellar/stellar-sdk');
 
 const app = express();
 
@@ -145,3 +147,4 @@ app.get('/api/audit-logs/:id', async (req, res, next) => {
 });
 
 module.exports = app;
+module.exports.requireAuth = requireAuth;
