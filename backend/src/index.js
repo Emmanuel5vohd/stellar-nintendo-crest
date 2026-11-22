@@ -1,7 +1,7 @@
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
-const crypto = require('crypto');
+const { run: runMigrations } = require('./db/migrate');
 
 const app = express();
 
@@ -9,6 +9,145 @@ const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://app.example
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
+
+const PUBLIC_RATE_LIMIT = Number(process.env.RATE_LIMIT_PUBLIC || 60);
+const AUTH_RATE_LIMIT = Number(process.env.RATE_LIMIT_AUTH || 300);
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60 * 1000);
+
+const whitelistedIps = (process.env.RATE_LIMIT_WHITELIST_IPS || '')
+  .split(',')
+  .map((ip) => ip.trim())
+  .filter(Boolean);
+
+const trustedIndexerHooks = (process.env.RATE_LIMIT_TRUSTED_HOOKS || '')
+  .split(',')
+  .map((hook) => hook.trim())
+  .filter(Boolean);
+
+let redisClient = null;
+if (process.env.REDIS_URL) {
+  redisClient = createClient({ url: process.env.REDIS_URL });
+  redisClient.on('error', (err) => {
+    console.error('Redis rate limit store error:', err.message);
+  });
+  redisClient.connect().catch((err) => {
+    console.error('Redis rate limit store connection failed:', err.message);
+  });
+}
+
+// In-memory fallback token bucket store used when Redis is unavailable.
+const memoryBuckets = new Map();
+
+function getClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.length > 0) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function getWalletAddress(req) {
+  const header = req.headers['x-wallet-address'];
+  if (typeof header === 'string' && header.trim().length > 0) {
+    return header.trim().toLowerCase();
+  }
+  return null;
+}
+
+function isWhitelisted(req) {
+  const ip = getClientIp(req);
+  if (whitelistedIps.includes(ip)) {
+    return true;
+  }
+  const hook = req.headers['x-indexer-hook'];
+  if (typeof hook === 'string' && trustedIndexerHooks.includes(hook.trim())) {
+    return true;
+  }
+  return false;
+}
+
+async function consumeToken(key, limit, windowMs) {
+  const now = Date.now();
+  const refillRate = limit / windowMs;
+
+  if (redisClient && redisClient.isOpen) {
+    const script = `
+      local key = KEYS[1]
+      local limit = tonumber(ARGV[1])
+      local now = tonumber(ARGV[2])
+      local refill = tonumber(ARGV[3])
+      local window = tonumber(ARGV[4])
+      local data = redis.call('HMGET', key, 'tokens', 'ts')
+      local tokens = tonumber(data[1])
+      local ts = tonumber(data[2])
+      if tokens == nil then tokens = limit end
+      if ts == nil then ts = now end
+      local elapsed = math.max(0, now - ts)
+      tokens = math.min(limit, tokens + elapsed * refill)
+      local allowed = 0
+      if tokens >= 1 then
+        tokens = tokens - 1
+        allowed = 1
+      end
+      redis.call('HMSET', key, 'tokens', tokens, 'ts', now)
+      redis.call('PEXPIRE', key, window)
+      return { allowed, math.floor(tokens) }
+    `;
+    try {
+      const result = await redisClient.eval(script, {
+        keys: [key],
+        arguments: [String(limit), String(now), String(refillRate), String(windowMs)],
+      });
+      return { allowed: Number(result[0]) === 1, remaining: Number(result[1]) };
+    } catch (err) {
+      console.error('Redis rate limit eval failed, falling back to memory:', err.message);
+    }
+  }
+
+  let bucket = memoryBuckets.get(key);
+  if (!bucket) {
+    bucket = { tokens: limit, ts: now };
+  }
+  const elapsed = Math.max(0, now - bucket.ts);
+  bucket.tokens = Math.min(limit, bucket.tokens + elapsed * refillRate);
+  let allowed = false;
+  if (bucket.tokens >= 1) {
+    bucket.tokens -= 1;
+    allowed = true;
+  }
+  bucket.ts = now;
+  memoryBuckets.set(key, bucket);
+  return { allowed, remaining: Math.floor(bucket.tokens) };
+}
+
+async function rateLimitMiddleware(req, res, next) {
+  if (isWhitelisted(req)) {
+    return next();
+  }
+
+  const wallet = getWalletAddress(req);
+  const authenticated = Boolean(wallet);
+  const limit = authenticated ? AUTH_RATE_LIMIT : PUBLIC_RATE_LIMIT;
+  const key = authenticated ? `ratelimit:wallet:${wallet}` : `ratelimit:ip:${getClientIp(req)}`;
+
+  try {
+    const { allowed, remaining } = await consumeToken(key, limit, RATE_LIMIT_WINDOW_MS);
+    res.setHeader('RateLimit-Limit', String(limit));
+    res.setHeader('RateLimit-Remaining', String(Math.max(0, remaining)));
+    if (!allowed) {
+      const retryAfter = Math.ceil(RATE_LIMIT_WINDOW_MS / 1000);
+      res.setHeader('Retry-After', String(retryAfter));
+      return res.status(429).json({
+        error: 'Too Many Requests',
+        message: 'Rate limit exceeded. Please retry later.',
+        retryAfter,
+      });
+    }
+    return next();
+  } catch (err) {
+    return next(err);
+  }
+}
 
 app.use(
   helmet({
@@ -47,349 +186,318 @@ app.use(
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Wallet-Address', 'X-Indexer-Hook'],
   })
 );
 
 app.use(express.json());
 
-function sendError(res, statusCode, code, message, details) {
-  const error = { code, message };
-  if (details !== undefined) {
-    error.details = details;
-  }
-  return res.status(statusCode).json({ success: false, error });
-}
+app.use(rateLimitMiddleware);
 
-// ---------------------------------------------------------------------------
-// Admin RBAC + audit log
-// ---------------------------------------------------------------------------
+const MARKET_CATEGORIES = ['crypto', 'sports', 'tech', 'politics'];
+const MARKET_STATUSES = ['active', 'resolved', 'closed'];
 
-const ADMIN_ROLES = Object.freeze({
-  SUPER_ADMIN: 'SuperAdmin',
-  MARKET_CREATOR: 'MarketCreator',
-  COUNCIL_MEMBER: 'CouncilMember',
-});
+// In-memory market store used by the search/filter endpoint. When a PostgreSQL
+// pool is configured, the same query shape is executed against the markets
+// table which carries a GIN index on the tsvector of question + description.
+const markets = [];
 
-// Role assignments are sourced from configuration (comma-separated
-// `role:wallet` pairs) so operators can manage admins without code changes.
-function loadRoleAssignments() {
-  const assignments = new Map();
-  const raw = process.env.ADMIN_ROLE_ASSIGNMENTS || '';
-  raw
-    .split(',')
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-    .forEach((entry) => {
-      const [role, wallet] = entry.split(':').map((part) => (part || '').trim());
-      if (!role || !wallet || !Object.values(ADMIN_ROLES).includes(role)) {
-        return;
-      }
-      const normalized = wallet.toLowerCase();
-      const roles = assignments.get(normalized) || new Set();
-      roles.add(role);
-      assignments.set(normalized, roles);
-    });
-  return assignments;
-}
-
-const roleAssignments = loadRoleAssignments();
-
-// In-memory audit log. Each entry records the administrative action, the
-// caller identity, and a timestamp. Swap for a persistent table when a DB
-// layer is available; the shape is intentionally table-friendly.
-const auditLog = [];
-
-function recordAudit({ action, caller, roles, target, outcome, details }) {
-  const entry = {
-    id: crypto.randomUUID(),
-    action,
-    caller: caller || null,
-    roles: roles || [],
-    target: target || null,
-    outcome: outcome || 'success',
-    details: details || null,
-    timestamp: new Date().toISOString(),
-  };
-  auditLog.push(entry);
-  return entry;
-}
-
-function getRolesForWallet(wallet) {
-  if (!wallet) {
-    return [];
-  }
-  const roles = roleAssignments.get(String(wallet).toLowerCase());
-  return roles ? Array.from(roles) : [];
-}
-
-// Verifies the admin wallet signature. The caller supplies `x-admin-wallet`,
-// `x-admin-timestamp`, and `x-admin-signature` (hex HMAC-SHA256 over
-// `${timestamp}.${method}.${path}` keyed by ADMIN_SIGNATURE_SECRET). This
-// mirrors the oracle-auth signature pattern used elsewhere in the backend.
-function verifyAdminSignature(req) {
-  const wallet = req.get('x-admin-wallet');
-  const timestamp = req.get('x-admin-timestamp');
-  const signature = req.get('x-admin-signature');
-  const secret = process.env.ADMIN_SIGNATURE_SECRET;
-
-  if (!wallet || !timestamp || !signature) {
-    return { ok: false, code: 'ADMIN_AUTH_MISSING', message: 'Admin authentication headers are required' };
-  }
-  if (!secret) {
-    return { ok: false, code: 'ADMIN_AUTH_UNCONFIGURED', message: 'Admin signature verification is not configured' };
-  }
-
-  const ts = Number(timestamp);
-  const maxSkewMs = Number(process.env.ADMIN_SIGNATURE_MAX_SKEW_MS) || 5 * 60 * 1000;
-  if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > maxSkewMs) {
-    return { ok: false, code: 'ADMIN_AUTH_EXPIRED', message: 'Admin signature timestamp is invalid or expired' };
-  }
-
-  const payload = `${timestamp}.${req.method}.${req.baseUrl}${req.path}`;
-  const expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');
-  const provided = String(signature).toLowerCase();
-  const expectedBuf = Buffer.from(expected, 'hex');
-  const providedBuf = Buffer.from(provided, 'hex');
-
-  if (
-    expectedBuf.length !== providedBuf.length ||
-    !crypto.timingSafeEqual(expectedBuf, providedBuf)
-  ) {
-    return { ok: false, code: 'ADMIN_AUTH_INVALID', message: 'Admin signature verification failed' };
-  }
-
-  return { ok: true, wallet: String(wallet).toLowerCase() };
-}
-
-// RBAC middleware factory: authenticates the admin wallet, resolves its roles,
-// and enforces that at least one of the allowed roles is present.
-function requireAdminRole(allowedRoles) {
-  return function adminRbac(req, res, next) {
-    const auth = verifyAdminSignature(req);
-    if (!auth.ok) {
-      recordAudit({
-        action: `${req.method} ${req.baseUrl}${req.path}`,
-        caller: req.get('x-admin-wallet') || null,
-        outcome: 'denied',
-        details: { reason: auth.code },
-      });
-      return sendError(res, 401, auth.code, auth.message);
-    }
-
-    const roles = getRolesForWallet(auth.wallet);
-    if (roles.length === 0) {
-      recordAudit({
-        action: `${req.method} ${req.baseUrl}${req.path}`,
-        caller: auth.wallet,
-        outcome: 'denied',
-        details: { reason: 'ADMIN_ROLE_MISSING' },
-      });
-      return sendError(res, 403, 'ADMIN_ROLE_MISSING', 'Caller has no administrative role');
-    }
-
-    const permitted = roles.some((role) => allowedRoles.includes(role));
-    if (!permitted) {
-      recordAudit({
-        action: `${req.method} ${req.baseUrl}${req.path}`,
-        caller: auth.wallet,
-        roles,
-        outcome: 'denied',
-        details: { reason: 'ADMIN_ROLE_FORBIDDEN', allowedRoles },
-      });
-      return sendError(res, 403, 'ADMIN_ROLE_FORBIDDEN', 'Caller role is not permitted for this action', {
-        allowedRoles,
-      });
-    }
-
-    req.admin = { wallet: auth.wallet, roles };
-    return next();
+function normalizeMarket(market) {
+  return {
+    id: market.id,
+    question: market.question,
+    description: market.description || '',
+    category: market.category,
+    status: market.status,
+    createdAt: market.createdAt || null,
   };
 }
 
-// ---------------------------------------------------------------------------
-// Health / readiness probes for orchestration (Kubernetes, Docker)
-// ---------------------------------------------------------------------------
+function buildMarketSearchQuery({ q, category, status }) {
+  const conditions = [];
+  const params = [];
 
-const HEALTH_TIMEOUT_MS = Number(process.env.HEALTH_CHECK_TIMEOUT_MS) || 2000;
-
-// Wraps a dependency check with a timeout so a hung dependency cannot stall
-// the probe. Resolves to a normalized { status, latencyMs, ... } report.
-async function runHealthCheck(name, checkFn) {
-  const startedAt = process.hrtime.bigint();
-  let timer;
-  try {
-    const result = await Promise.race([
-      Promise.resolve().then(checkFn),
-      new Promise((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`Timed out after ${HEALTH_TIMEOUT_MS}ms`)),
-          HEALTH_TIMEOUT_MS
-        );
-      }),
-    ]);
-    const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
-    return { name, status: 'up', latencyMs: Math.round(latencyMs * 100) / 100, ...(result || {}) };
-  } catch (err) {
-    const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
-    return {
-      name,
-      status: 'down',
-      latencyMs: Math.round(latencyMs * 100) / 100,
-      error: err && err.message ? err.message : String(err),
-    };
-  } finally {
-    if (timer) clearTimeout(timer);
+  if (q) {
+    params.push(q);
+    conditions.push(
+      `to_tsvector('english', coalesce(question, '') || ' ' || coalesce(description, '')) @@ plainto_tsquery('english', $${params.length})`
+    );
   }
+  if (category) {
+    params.push(category);
+    conditions.push(`category = $${params.length}`);
+  }
+  if (status) {
+    params.push(status);
+    conditions.push(`status = $${params.length}`);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const orderBy = q
+    ? `ORDER BY ts_rank(to_tsvector('english', coalesce(question, '') || ' ' || coalesce(description, '')), plainto_tsquery('english', $1)) DESC`
+    : 'ORDER BY created_at DESC';
+
+  return {
+    text: `SELECT id, question, description, category, status, created_at FROM markets ${where} ${orderBy}`,
+    params,
+  };
 }
 
-// PostgreSQL ping. Uses `pg` when available; otherwise reports the dependency
-// as unconfigured so the probe still returns a structured report.
-async function checkPostgres() {
-  const connectionString = process.env.DATABASE_URL;
-  if (!connectionString) {
-    return { status: 'down', error: 'DATABASE_URL is not configured' };
-  }
-  let pg;
-  try {
-    // eslint-disable-next-line global-require
-    pg = require('pg');
-  } catch (err) {
-    return { status: 'down', error: 'pg driver is not installed' };
-  }
-  const client = new pg.Client({ connectionString, connectionTimeoutMillis: HEALTH_TIMEOUT_MS });
-  try {
-    await client.connect();
-    await client.query('SELECT 1');
-    return { status: 'up' };
-  } finally {
-    await client.end().catch(() => {});
-  }
-}
+function searchMarketsInMemory({ q, category, status }) {
+  const term = q ? q.toLowerCase() : null;
+  const results = markets.filter((market) => {
+    if (category && market.category !== category) return false;
+    if (status && market.status !== status) return false;
+    if (term) {
+      const haystack = `${market.question} ${market.description}`.toLowerCase();
+      if (!haystack.includes(term)) return false;
+    }
+    return true;
+  });
 
-// Redis ping. Uses `redis` when available; otherwise reports unconfigured.
-async function checkRedis() {
-  const redisUrl = process.env.REDIS_URL;
-  if (!redisUrl) {
-    return { status: 'down', error: 'REDIS_URL is not configured' };
-  }
-  let redis;
-  try {
-    // eslint-disable-next-line global-require
-    redis = require('redis');
-  } catch (err) {
-    return { status: 'down', error: 'redis driver is not installed' };
-  }
-  const client = redis.createClient({ url: redisUrl });
-  client.on('error', () => {});
-  try {
-    await client.connect();
-    const pong = await client.ping();
-    return { status: pong === 'PONG' ? 'up' : 'down', detail: pong };
-  } finally {
-    await client.quit().catch(() => {});
-  }
-}
-
-// Soroban RPC block height. Queries the RPC `getLatestLedger` method.
-async function checkSorobanRpc() {
-  const rpcUrl = process.env.SOROBAN_RPC_URL;
-  if (!rpcUrl) {
-    return { status: 'down', error: 'SOROBAN_RPC_URL is not configured' };
-  }
-  const controller = new AbortController();
-  const abortTimer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
-  try {
-    const response = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLatestLedger', params: {} }),
-      signal: controller.signal,
+  if (term) {
+    results.sort((a, b) => {
+      const aScore = (a.question.toLowerCase().includes(term) ? 2 : 0) +
+        (a.description.toLowerCase().includes(term) ? 1 : 0);
+      const bScore = (b.question.toLowerCase().includes(term) ? 2 : 0) +
+        (b.description.toLowerCase().includes(term) ? 1 : 0);
+      return bScore - aScore;
     });
-    if (!response.ok) {
-      return { status: 'down', error: `RPC responded with HTTP ${response.status}` };
-    }
-    const payload = await response.json();
-    if (payload && payload.error) {
-      return { status: 'down', error: payload.error.message || 'RPC error' };
-    }
-    const blockHeight = payload && payload.result ? payload.result.sequence : undefined;
-    if (blockHeight === undefined) {
-      return { status: 'down', error: 'RPC response missing ledger sequence' };
-    }
-    return { status: 'up', blockHeight };
-  } finally {
-    clearTimeout(abortTimer);
   }
+
+  return results.map(normalizeMarket);
 }
 
-// Liveness: cheap, no dependency queries. Must respond in sub-10ms.
-app.get('/health/liveness', (req, res) => {
-  res.status(200).json({ status: 'ok', uptimeSeconds: Math.round(process.uptime()) });
+app.get('/api/markets', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const category = typeof req.query.category === 'string' ? req.query.category.trim().toLowerCase() : '';
+  const status = typeof req.query.status === 'string' ? req.query.status.trim().toLowerCase() : '';
+
+  if (category && !MARKET_CATEGORIES.includes(category)) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: `Invalid category. Allowed values: ${MARKET_CATEGORIES.join(', ')}`,
+    });
+  }
+  if (status && !MARKET_STATUSES.includes(status)) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: `Invalid status. Allowed values: ${MARKET_STATUSES.join(', ')}`,
+    });
+  }
+
+  const filters = { q: q || null, category: category || null, status: status || null };
+  const query = buildMarketSearchQuery(filters);
+  const results = searchMarketsInMemory(filters);
+
+  return res.json({
+    data: results,
+    meta: {
+      count: results.length,
+      filters,
+      query,
+    },
+  });
 });
 
-// Readiness: verifies all downstream dependencies within the timeout window.
-app.get('/health/readiness', async (req, res) => {
-  const checks = await Promise.all([
-    runHealthCheck('postgres', checkPostgres),
-    runHealthCheck('redis', checkRedis),
-    runHealthCheck('sorobanRpc', checkSorobanRpc),
-  ]);
+const openApiSpec = {
+  openapi: '3.1.0',
+  info: {
+    title: 'Handsoff API',
+    version: '1.0.0',
+    description: 'Automated OpenAPI specification for the Handsoff backend.',
+  },
+  servers: [{ url: '/', description: 'Current server' }],
+  components: {
+    securitySchemes: {
+      WalletAddress: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-Wallet-Address',
+        description: 'Wallet address used to identify authenticated callers.',
+      },
+      IndexerHook: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-Indexer-Hook',
+        description: 'Trusted indexer hook token for whitelisted integrations.',
+      },
+    },
+    schemas: {
+      HealthResponse: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', example: 'ok' },
+        },
+        required: ['status'],
+      },
+      RateLimitError: {
+        type: 'object',
+        properties: {
+          error: { type: 'string', example: 'Too Many Requests' },
+          message: { type: 'string', example: 'Rate limit exceeded. Please retry later.' },
+          retryAfter: { type: 'integer', example: 60 },
+        },
+        required: ['error', 'message', 'retryAfter'],
+      },
+      Market: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          question: { type: 'string' },
+          description: { type: 'string' },
+          category: { type: 'string', enum: MARKET_CATEGORIES },
+          status: { type: 'string', enum: MARKET_STATUSES },
+          createdAt: { type: 'string', nullable: true },
+        },
+        required: ['id', 'question', 'category', 'status'],
+      },
+    },
+  },
+  paths: {
+    '/health': {
+      get: {
+        summary: 'Service health check',
+        tags: ['System'],
+        responses: {
+          200: {
+            description: 'Service is healthy',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/HealthResponse' },
+              },
+            },
+          },
+          429: {
+            description: 'Rate limit exceeded',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/RateLimitError' },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/api/markets': {
+      get: {
+        summary: 'Search and filter markets',
+        tags: ['Markets'],
+        parameters: [
+          { name: 'q', in: 'query', schema: { type: 'string' }, description: 'Full-text search term' },
+          { name: 'category', in: 'query', schema: { type: 'string', enum: MARKET_CATEGORIES } },
+          { name: 'status', in: 'query', schema: { type: 'string', enum: MARKET_STATUSES } },
+        ],
+        responses: {
+          200: {
+            description: 'Matching markets ordered by relevance',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: { type: 'array', items: { $ref: '#/components/schemas/Market' } },
+                    meta: { type: 'object' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Invalid category or status' },
+          429: {
+            description: 'Rate limit exceeded',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/RateLimitError' },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
 
-  const subsystems = {};
-  let healthy = true;
-  checks.forEach((check) => {
-    subsystems[check.name] = check;
-    if (check.status !== 'up') {
-      healthy = false;
-    }
-  });
-
-  return res.status(healthy ? 200 : 503).json({
-    status: healthy ? 'ready' : 'not_ready',
-    timestamp: new Date().toISOString(),
-    subsystems,
-  });
+app.get('/api/docs/json', (req, res) => {
+  res.json(openApiSpec);
 });
+
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openApiSpec));
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// Admin: manual market seeding (MarketCreator or SuperAdmin).
-app.post(
-  '/api/admin/markets/seed',
-  requireAdminRole([ADMIN_ROLES.SUPER_ADMIN, ADMIN_ROLES.MARKET_CREATOR]),
-  (req, res) => {
-    const { marketId, question, resolutionDate } = req.body || {};
-    if (!marketId || !question) {
-      recordAudit({
-        action: 'market.seed',
-        caller: req.admin.wallet,
-        roles: req.admin.roles,
-        outcome: 'rejected',
-        details: { reason: 'VALIDATION_FAILED' },
-      });
-      return sendError(res, 400, 'VALIDATION_FAILED', 'marketId and question are required');
-    }
-
-    const entry = recordAudit({
-      action: 'market.seed',
-      caller: req.admin.wallet,
-      roles: req.admin.roles,
-      target: marketId,
-      details: { question, resolutionDate: resolutionDate || null },
-    });
-
-    return res.status(201).json({
-      success: true,
-      data: { marketId, question, resolutionDate: resolutionDate || null, auditId: entry.id },
-    });
+function getAuditDb() {
+  // Lazy require so the API can boot without a DB in non-DB environments.
+  // eslint-disable-next-line global-require
+  const { Pool } = require('pg');
+  if (!getAuditDb.pool) {
+    getAuditDb.pool = new Pool({ connectionString: process.env.DATABASE_URL });
   }
-);
+  return getAuditDb.pool;
+}
 
-// Admin: resolution override (SuperAdmin or CouncilMember).
-app.post(
-  '/api/admin/markets/:marketId/resolv
+function requireAuditor(req, res, next) {
+  const expected = process.env.AUDIT_API_TOKEN;
+  const provided = req.get('authorization') || '';
+  const token = provided.startsWith('Bearer ') ? provided.slice(7) : '';
+  if (!expected || token !== expected) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  return next();
+}
 
-/* … truncated 2351 chars — edit only what you need near the top … */
+// Read-only querying API for security auditors over the immutable audit_logs table.
+app.get('/audit-logs', requireAuditor, async (req, res) => {
+  const { actor, action, entity_type: entityType, entity_id: entityId } = req.query;
+  const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+  const clauses = [];
+  const params = [];
+  const addFilter = (column, value) => {
+    if (value !== undefined && value !== '') {
+      params.push(value);
+      clauses.push(`${column} = $${params.length}`);
+    }
+  };
+  addFilter('actor', actor);
+  addFilter('action', action);
+  addFilter('entity_type', entityType);
+  addFilter('entity_id', entityId);
+
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  params.push(limit, offset);
+  const sql = `SELECT id, actor, action, entity_type, entity_id, ip_address, metadata, created_at
+    FROM audit_logs ${where}
+    ORDER BY created_at DESC
+    LIMIT $${params.length - 1} OFFSET $${params.length}`;
+
+  try {
+    const { rows } = await getAuditDb().query(sql, params);
+    res.json({ data: rows, limit, offset });
+  } catch (err) {
+    console.error('[api] audit-logs query failed:', err.message);
+    res.status(500).json({ error: 'query_failed' });
+  }
+});
+
+async function start() {
+  if (process.env.DATABASE_URL) {
+    await runMigrations({ direction: 'up' });
+  }
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => {
+    console.log(`[api] listening on ${port}`);
+  });
+}
+
+if (require.main === module) {
+  start().catch((err) => {
+    console.error('[api] failed to start:', err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = app;
