@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
@@ -5,6 +6,9 @@ const crypto = require('crypto');
 const { Keypair, Networks, TransactionBuilder, Transaction, Operation, Account, BASE_FEE } = require('@stellar/stellar-sdk');
 
 const app = express();
+
+const ORACLE_HMAC_SECRET = process.env.ORACLE_HMAC_SECRET || '';
+const ORACLE_TIMESTAMP_TOLERANCE_SECONDS = 300;
 
 const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://app.example.com,https://www.example.com')
   .split(',')
@@ -47,7 +51,7 @@ app.use(
       return callback(new Error('Not allowed by CORS'));
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Oracle-Signature', 'X-Oracle-Timestamp'],
     credentials: true,
     maxAge: 86400,
   })

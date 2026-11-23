@@ -148,6 +148,53 @@ export class OracleDaemon extends EventEmitter {
       this.timer = null;
     }
   }
+
+  /**
+   * Reads treasury balances, reports alerts below threshold, and triggers auto-replenishment
+   * when the relayer wallet is low. Failures are counted, not thrown, so a monitoring hiccup
+   * never stalls market resolution.
+   */
+  private async checkTreasury(): Promise<void> {
+    if (!this.deps.readTreasury) return;
+    let snapshot: TreasurySnapshot;
+    try {
+      snapshot = await this.deps.readTreasury();
+    } catch {
+      this.health.failures++;
+      return;
+    }
+
+    this.health.walletXlm = snapshot.walletXlm;
+    this.health.bondCapacity = snapshot.bondCapacity;
+
+    if (snapshot.walletXlm < MIN_WALLET_XLM) {
+      this.emitAlert({
+        kind: "wallet-low",
+        message: `Oracle relayer wallet XLM balance ${snapshot.walletXlm} is below ${MIN_WALLET_XLM}`,
+        snapshot,
+      });
+      if (this.deps.autoReplenish) {
+        try {
+          await this.deps.autoReplenish(snapshot);
+        } catch {
+          this.health.failures++;
+        }
+      }
+    }
+
+    if (snapshot.bondCapacity < MIN_BOND_CAPACITY) {
+      this.emitAlert({
+        kind: "bond-depleted",
+        message: `Escrowed challenge bond capacity ${snapshot.bondCapacity} is depleted`,
+        snapshot,
+      });
+    }
+  }
+
+  private emitAlert(alert: TreasuryAlert): void {
+    this.health.treasuryAlerts++;
+    this.deps.reportTreasuryAlert?.(alert);
+  }
 }
 
 export interface ProposedOutcome {
