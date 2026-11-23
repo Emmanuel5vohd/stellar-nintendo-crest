@@ -1,80 +1,63 @@
-import { xdr, Address, scValToNative } from '@stellar/stellar-sdk';
+import { Pool } from 'pg';
+import { pool } from '../db/pool';
 import { logger } from '../utils/logger';
 
-export type ScValTopic =
-  | { type: 'symbol'; value: string }
-  | { type: 'address'; value: string }
-  | { type: 'i128'; value: bigint }
-  | { type: 'u64'; value: bigint }
-  | { type: 'vec'; value: ScValTopic[] }
-  | { type: 'unknown'; raw: string };
-
-function toHex(raw: unknown): string {
-  try {
-    if (raw instanceof xdr.ScVal) {
-      return raw.toXDR().toString('hex');
-    }
-    if (Buffer.isBuffer(raw)) {
-      return raw.toString('hex');
-    }
-    if (typeof raw === 'string') {
-      return Buffer.from(raw, 'utf8').toString('hex');
-    }
-    return Buffer.from(JSON.stringify(raw) ?? '').toString('hex');
-  } catch {
-    return '';
-  }
-}
-
-function parseAddress(scVal: xdr.ScVal): string {
-  const address = Address.fromScVal(scVal);
-  // toString() handles account (G...), muxed (M...) and contract (C...) addresses.
-  return address.toString();
+export interface UnmappedEvent {
+  ledgerSequence: number;
+  contractId: string;
+  topic: string;
+  payload: unknown;
+  reason: string;
 }
 
 /**
- * Parse a raw Soroban ScVal contract event topic into a typed model.
- * Uses strict type checking and exhaustive switch cases so unexpected
- * shapes are logged with their raw hex payload instead of throwing.
+ * Persist an event that could not be decoded or failed schema validation
+ * into the `indexer_dlq` table so the indexer can keep ingesting ledgers.
+ * Never throws: DLQ persistence failures are logged and swallowed so a
+ * single malformed event cannot crash the daemon.
  */
-export function parseScValTopic(scVal: xdr.ScVal): ScValTopic {
+export async function recordUnmappedEvent(
+  event: UnmappedEvent,
+  db: Pool = pool,
+): Promise<void> {
   try {
-    switch (scVal.switch()) {
-      case xdr.ScValType.scvSymbol():
-        return { type: 'symbol', value: scVal.sym().toString() };
-      case xdr.ScValType.scvAddress():
-        return { type: 'address', value: parseAddress(scVal) };
-      case xdr.ScValType.scvI128(): {
-        const native = scValToNative(scVal);
-        return { type: 'i128', value: BigInt(native as bigint | string | number) };
-      }
-      case xdr.ScValType.scvU64(): {
-        const native = scValToNative(scVal);
-        return { type: 'u64', value: BigInt(native as bigint | string | number) };
-      }
-      case xdr.ScValType.scvVec(): {
-        const items = scVal.vec() ?? [];
-        return { type: 'vec', value: items.map((item) => parseScValTopic(item)) };
-      }
-      default: {
-        const raw = toHex(scVal);
-        logger.error(
-          { scValType: scVal.switch().name, rawHex: raw },
-          'Unexpected ScVal topic shape encountered while parsing contract event',
-        );
-        return { type: 'unknown', raw };
-      }
-    }
-  } catch (err) {
-    const raw = toHex(scVal);
-    logger.error(
-      { err, rawHex: raw },
-      'Failed to parse ScVal topic; returning unknown variant',
+    await db.query(
+      `INSERT INTO indexer_dlq
+         (ledger_sequence, contract_id, topic, raw_payload, error_message, error_stack, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW())`,
+      [
+        event.ledgerSequence,
+        event.contractId,
+        event.topic,
+        JSON.stringify(event.payload ?? null),
+        event.reason,
+        event.reason,
+      ],
     );
-    return { type: 'unknown', raw };
+  } catch (err) {
+    logger.error('Failed to persist event to indexer_dlq', {
+      ledgerSequence: event.ledgerSequence,
+      contractId: event.contractId,
+      topic: event.topic,
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
-export function parseScValTopics(topics: xdr.ScVal[]): ScValTopic[] {
-  return topics.map((topic) => parseScValTopic(topic));
+/**
+ * Wrap a decode/validate handler so any thrown error is routed to the DLQ
+ * instead of propagating and halting the indexer loop.
+ */
+export async function withDlq<T>(
+  event: UnmappedEvent,
+  handler: () => Promise<T>,
+  db: Pool = pool,
+): Promise<T | undefined> {
+  try {
+    return await handler();
+  } catch (err) {
+    const reason = err instanceof Error ? err.stack ?? err.message : String(err);
+    await recordUnmappedEvent({ ...event, reason }, db);
+    return undefined;
+  }
 }

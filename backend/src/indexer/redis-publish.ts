@@ -34,6 +34,11 @@ export function channelFor(topic: string): string {
   return `stellar:events:${topic}`;
 }
 
+/** Redis hash key holding the cached stats for one market, `stellar:market:stats:<marketId>`. */
+export function marketStatsKey(marketId: number): string {
+  return `stellar:market:stats:${marketId}`;
+}
+
 /**
  * Channel name for the WebSocket bridge of one market, `stellar:ws:market:<marketId>`.
  * Clients subscribe to this topic to receive only events for that market.
@@ -64,35 +69,30 @@ export async function publishCommittedEvent(
   }
 }
 
+/** Minimal Redis surface needed to invalidate a cached market stats hash. */
+export interface CacheClient {
+  del(...keys: string[]): Promise<number>;
+}
+
 /**
- * Bridges one committed event to WebSocket clients (#211). Only the broadcast event types are
- * forwarded, and only when the event carries a `marketId`, so the WebSocket server can route it
- * to the matching `market_id` topic. Returns `true` when the message was sent, and `false` when
- * the event was skipped or the publish failed. It never throws.
+ * Invalidates the cached market stats hash after a new bet has been committed (#241). The next
+ * market odds query will miss the cache, fall back to the database, and repopulate the hash.
+ *
+ * Like {@link publishCommittedEvent}, a Redis failure is logged and swallowed so it cannot block
+ * or roll back the indexing transaction.
  */
-export async function publishToWebSocketBridge(
-  client: PubSubClient,
+export async function invalidateMarketStats(
+  client: CacheClient,
   logger: PublishLogger,
-  notice: LedgerEventNotice,
+  marketId: number,
 ): Promise<boolean> {
-  if (!(BROADCAST_EVENT_TYPES as readonly string[]).includes(notice.type)) {
-    return false;
-  }
-  if (typeof notice.marketId !== "number") {
-    return false;
-  }
   try {
-    await client.publish(wsMarketChannelFor(notice.marketId), JSON.stringify(notice));
+    await client.del(marketStatsKey(marketId));
     return true;
   } catch (err) {
     logger.warn(
-      {
-        event: "ws_bridge_publish_failed",
-        type: notice.type,
-        marketId: notice.marketId,
-        error: err instanceof Error ? err.message : String(err),
-      },
-      "Could not bridge indexed event to WebSocket clients; the database commit is unaffected",
+      { event: "redis_cache_invalidate_failed", marketId, error: err instanceof Error ? err.message : String(err) },
+      "Could not invalidate cached market stats; the database commit is unaffected",
     );
     return false;
   }

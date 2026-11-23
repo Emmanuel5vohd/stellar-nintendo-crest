@@ -4,6 +4,9 @@
  * Runs every five minutes over `dlq_events`. Each unhandled item with `retry_count < MAX_RETRIES`
  * is dispatched again. An item that fails is retried after an exponential backoff. An item that
  * reaches the limit is marked permanent and reported, with its stack trace kept for debugging.
+ *
+ * Also provides the admin CLI surface (#218) to inspect and retry DLQ items, and the helper used
+ * by the indexer event path to persist unparsable/malformed events into `indexer_dlq`.
  */
 
 export const DLQ_INTERVAL_MS = 5 * 60 * 1000;
@@ -62,102 +65,89 @@ export async function retryDeadLetters(deps: DlqRetryDeps): Promise<number> {
 }
 
 /**
- * Batched insert buffer (#210).
+ * Persistence surface for the `indexer_dlq` table (#218).
  *
- * Accumulates high-frequency events (e.g. `BetPlacedEvent`) and flushes them as a single
- * `INSERT ... ON CONFLICT` statement inside an atomic transaction. Flushes happen when the
- * buffer reaches `maxBatchSize` or after `flushIntervalMs` elapses. If a flush fails, the
- * buffered events are retained and re-queued so nothing is dropped; the failure is surfaced
- * through the existing DLQ/alert path.
+ * The indexer event path calls `record` whenever an event fails decoding or schema validation,
+ * so a single malformed event is captured instead of crashing the daemon.
  */
-export const DEFAULT_BATCH_SIZE = 100;
-export const DEFAULT_FLUSH_INTERVAL_MS = 1_000;
-
-export interface BatchInsertStore<T> {
-  /** Executes a single `INSERT ... ON CONFLICT` for the given rows in one transaction. */
-  insertBatch(rows: T[]): Promise<void>;
+export interface IndexerDlqStore {
+  record(entry: IndexerDlqEntry): Promise<number>;
+  list(limit: number): Promise<IndexerDlqRow[]>;
+  get(id: number): Promise<IndexerDlqRow | undefined>;
+  markRetried(id: number): Promise<void>;
 }
 
-export interface BatchWriterDeps<T> {
-  store: BatchInsertStore<T>;
-  /** Called when a flush fails after events were retained for retry. */
-  onFlushError?(error: unknown, retained: T[]): void;
-  maxBatchSize?: number;
-  flushIntervalMs?: number;
+export interface IndexerDlqEntry {
+  ledgerSequence: number;
+  payload: unknown;
+  errorMessage: string;
+  errorStack?: string;
 }
 
-export class BatchWriter<T> {
-  private buffer: T[] = [];
-  private timer: ReturnType<typeof setTimeout> | null = null;
-  private flushing: Promise<void> | null = null;
-  private readonly maxBatchSize: number;
-  private readonly flushIntervalMs: number;
+export interface IndexerDlqRow extends IndexerDlqEntry {
+  id: number;
+  retryCount: number;
+  retriedAt: Date | null;
+  createdAt: Date;
+}
 
-  constructor(private readonly deps: BatchWriterDeps<T>) {
-    this.maxBatchSize = deps.maxBatchSize ?? DEFAULT_BATCH_SIZE;
-    this.flushIntervalMs = deps.flushIntervalMs ?? DEFAULT_FLUSH_INTERVAL_MS;
+/**
+ * Serialize a raw event payload for storage. Falls back to a string form when the payload is not
+ * JSON-serializable (e.g. BigInt or circular references) so recording never throws.
+ */
+export function serializePayload(payload: unknown): string {
+  try {
+    return JSON.stringify(payload, (_key, value) =>
+      typeof value === 'bigint' ? value.toString() : value,
+    );
+  } catch {
+    return String(payload);
   }
+}
 
-  /** Queue an event for insertion. Triggers an immediate flush when the batch is full. */
-  enqueue(event: T): void {
-    this.buffer.push(event);
-    if (this.buffer.length >= this.maxBatchSize) {
-      void this.flush();
-    } else {
-      this.scheduleFlush();
-    }
+/**
+ * Capture a failed event into the DLQ. Never throws: a failure to record must not take down the
+ * indexer, so the error is reported through `alert` instead.
+ */
+export async function recordMalformedEvent(
+  store: IndexerDlqStore,
+  entry: IndexerDlqEntry,
+  alert: (message: string) => void,
+): Promise<number | undefined> {
+  try {
+    return await store.record(entry);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    alert(`Failed to record malformed event at ledger ${entry.ledgerSequence}: ${message}`);
+    return undefined;
   }
+}
 
-  /** Number of events currently buffered (including retained events after a failure). */
-  get pending(): number {
-    return this.buffer.length;
+/**
+ * Admin CLI: inspect DLQ items. Returns the most recent rows for display.
+ */
+export async function inspectDlq(store: IndexerDlqStore, limit = 50): Promise<IndexerDlqRow[]> {
+  return store.list(limit);
+}
+
+/**
+ * Admin CLI: retry a single DLQ item by id. Re-dispatches the stored payload; on success the item
+ * is marked retried, on failure the error is surfaced to the caller.
+ */
+export async function retryDlqItem(
+  store: IndexerDlqStore,
+  id: number,
+  dispatch: (payload: unknown) => Promise<void>,
+): Promise<{ ok: boolean; error?: string }> {
+  const row = await store.get(id);
+  if (!row) {
+    return { ok: false, error: `DLQ item ${id} not found` };
   }
-
-  private scheduleFlush(): void {
-    if (this.timer !== null) return;
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      void this.flush();
-    }, this.flushIntervalMs);
-    // Do not keep the process alive solely for a pending flush.
-    if (typeof this.timer === 'object' && this.timer !== null && 'unref' in this.timer) {
-      (this.timer as { unref(): void }).unref();
-    }
-  }
-
-  /**
-   * Flush the current buffer as one atomic batch. On failure the events are retained at the
-   * front of the buffer so a later flush retries them; nothing is dropped.
-   */
-  async flush(): Promise<void> {
-    if (this.flushing) return this.flushing;
-    if (this.buffer.length === 0) return;
-
-    const batch = this.buffer;
-    this.buffer = [];
-
-    this.flushing = (async () => {
-      try {
-        await this.deps.store.insertBatch(batch);
-      } catch (err) {
-        // Retain failed events ahead of any newly queued ones so ordering is preserved.
-        this.buffer = batch.concat(this.buffer);
-        this.deps.onFlushError?.(err, batch);
-        this.scheduleFlush();
-      } finally {
-        this.flushing = null;
-      }
-    })();
-
-    return this.flushing;
-  }
-
-  /** Flush any remaining events and stop the timer. */
-  async close(): Promise<void> {
-    if (this.timer !== null) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    await this.flush();
+  try {
+    await dispatch(row.payload);
+    await store.markRetried(id);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
