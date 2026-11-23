@@ -9,6 +9,8 @@
  * installed yet. The shape is the same as a zod schema would describe.
  */
 
+import { Address, scValToNative, xdr } from "@stellar/stellar-sdk";
+
 export interface RawContractEvent {
   topic: string;
   contractId: string;
@@ -50,6 +52,65 @@ export function parseContractEvent(raw: unknown): ParseResult {
 }
 
 /**
+ * A dead-letter record for an event that could not be parsed or validated (#218).
+ *
+ * The raw payload is serialized so an operator can inspect and retry it later via the admin
+ * CLI. `ledger` is best-effort: it is extracted from the raw event when present so the DLQ row
+ * can be correlated with the ingestion position even when the rest of the shape is invalid.
+ */
+export interface DeadLetterRecord {
+  /** JSON-serialized raw event payload. */
+  payload: string;
+  /** Human-readable error message (joined validation reasons or thrown error). */
+  errorMessage: string;
+  /** Stack trace when the failure came from a thrown exception; null for validation failures. */
+  errorStack: string | null;
+  /** Ledger sequence the event belongs to, when it could be recovered from the payload. */
+  ledger: number | null;
+}
+
+/**
+ * Serializes a raw event payload to JSON without throwing on circular or non-serializable data.
+ */
+const serializePayload = (raw: unknown): string => {
+  try {
+    const json = JSON.stringify(raw);
+    return json === undefined ? String(raw) : json;
+  } catch (err) {
+    return `[unserializable payload: ${String(err)}]`;
+  }
+};
+
+/**
+ * Best-effort extraction of the ledger sequence from a raw event, used to correlate DLQ rows.
+ */
+const extractLedger = (raw: unknown): number | null => {
+  if (typeof raw !== "object" || raw === null) return null;
+  const ledger = (raw as Record<string, unknown>).ledger;
+  return isNonNegativeInt(ledger) ? ledger : null;
+};
+
+/**
+ * Builds a DLQ record from a failed event. Accepts either validation reasons or a thrown error
+ * so both failure modes are captured with the same shape.
+ */
+export function buildDeadLetterRecord(
+  raw: unknown,
+  reasons: string[],
+  err?: unknown,
+): DeadLetterRecord {
+  const errorMessage = err !== undefined ? String(err) : reasons.join("; ");
+  const errorStack =
+    err instanceof Error && typeof err.stack === "string" ? err.stack : null;
+  return {
+    payload: serializePayload(raw),
+    errorMessage: errorMessage.length > 0 ? errorMessage : "unknown parse failure",
+    errorStack,
+    ledger: extractLedger(raw),
+  };
+}
+
+/**
  * Parses a batch and routes each failure to `onDeadLetter` instead of throwing, so one bad
  * event never stops the loop. Returns the events that passed.
  */
@@ -74,151 +135,41 @@ export function parseEventsOrDeadLetter(
 }
 
 /**
- * Computes a deterministic event hash from `(ledger_sequence, tx_hash, event_index)` (#220).
+ * Notification storage schema (#253).
  *
- * The same on-chain event always yields the same hash, so a restart that re-reads a partially
- * processed ledger produces identical hashes. Persisting this value in a `UNIQUE` column and
- * inserting with `ON CONFLICT DO NOTHING` makes writes idempotent: duplicate bet rows and
- * inflated pool totals are prevented at the database level.
+ * These DDL statements create the tables that remember a user's communication preferences
+ * and their registered push device tokens. Both tables are keyed by the user's wallet
+ * address, which is indexed for instant lookup when an event trigger fires.
  *
- * Uses FNV-1a (64-bit) so the hash is stable across processes and needs no crypto dependency.
- */
-export function computeEventHash(
-  ledgerSequence: number,
-  txHash: string,
-  eventIndex: number,
-): string {
-  const input = `${ledgerSequence}:${txHash}:${eventIndex}`;
-  // FNV-1a 64-bit constants.
-  const FNV_OFFSET = 0xcbf29ce484222325n;
-  const FNV_PRIME = 0x100000001b3n;
-  const MASK = 0xffffffffffffffffn;
-
-  let hash = FNV_OFFSET;
-  for (let i = 0; i < input.length; i++) {
-    hash ^= BigInt(input.charCodeAt(i));
-    hash = (hash * FNV_PRIME) & MASK;
-  }
-  return hash.toString(16).padStart(16, "0");
-}
-
-/**
- * Convenience wrapper: derives the event hash for a validated raw event.
- */
-export function eventHashFor(event: RawContractEvent): string {
-  return computeEventHash(event.ledger, event.txHash, event.eventIndex);
-}
-
-/**
- * Domain parser identifiers. Each monitored contract is mapped to one of these, so events are
- * routed to the correct parser based on the emitting contract ID (#221).
- */
-export type DomainParserId = "prediction-market" | "governance" | "sidecar-registry";
-
-/**
- * One entry in the monitored-contract configuration. `address` is the on-chain contract ID and
- * `parser` selects the domain parser that handles its events.
- */
-export interface MonitoredContract {
-  address: string;
-  parser: DomainParserId;
-  /** Optional human-readable label used in log prefixes. Defaults to the parser id. */
-  label?: string;
-}
-
-/**
- * Loads the array of monitored contracts from a JSON config value (env var or config file
- * contents). Accepts either a bare array or an object with a `contracts` array.
+ * `user_notification_settings` holds one row per wallet address with boolean toggles for
+ * bet settlement, dispute alerts, and referral commission notifications.
  *
- * Invalid entries are skipped and reported via `onInvalid` rather than throwing, so a single
- * bad entry never prevents the remaining contracts from being monitored.
+ * `device_tokens` enforces a one-to-many relationship between a wallet address and its
+ * push tokens via a foreign key back to `user_notification_settings`.
  */
-export function loadMonitoredContracts(
-  raw: string | undefined,
-  onInvalid: (reason: string) => void = () => {},
-): MonitoredContract[] {
-  if (!raw || raw.trim().length === 0) return [];
+export const NOTIFICATION_SCHEMA_MIGRATION = `
+CREATE TABLE IF NOT EXISTS user_notification_settings (
+  wallet_address TEXT PRIMARY KEY,
+  bet_settlement_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  dispute_alerts_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  referral_commission_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    onInvalid(`monitored contracts config is not valid JSON: ${String(err)}`);
-    return [];
-  }
+CREATE INDEX IF NOT EXISTS idx_user_notification_settings_wallet
+  ON user_notification_settings (wallet_address);
 
-  const list = Array.isArray(parsed)
-    ? parsed
-    : typeof parsed === "object" && parsed !== null && Array.isArray((parsed as Record<string, unknown>).contracts)
-      ? ((parsed as Record<string, unknown>).contracts as unknown[])
-      : null;
+CREATE TABLE IF NOT EXISTS device_tokens (
+  id BIGSERIAL PRIMARY KEY,
+  wallet_address TEXT NOT NULL
+    REFERENCES user_notification_settings (wallet_address) ON DELETE CASCADE,
+  token TEXT NOT NULL,
+  platform TEXT NOT NULL DEFAULT 'unknown',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (wallet_address, token)
+);
 
-  if (list === null) {
-    onInvalid("monitored contracts config must be an array or an object with a contracts array");
-    return [];
-  }
-
-  const validParsers: DomainParserId[] = ["prediction-market", "governance", "sidecar-registry"];
-  const contracts: MonitoredContract[] = [];
-  const seen = new Set<string>();
-
-  for (const entry of list) {
-    if (typeof entry !== "object" || entry === null) {
-      onInvalid("contract entry is not an object");
-      continue;
-    }
-    const e = entry as Record<string, unknown>;
-    if (!isString(e.address)) {
-      onInvalid("contract entry is missing a non-empty address");
-      continue;
-    }
-    if (!isString(e.parser) || !validParsers.includes(e.parser as DomainParserId)) {
-      onInvalid(`contract ${e.address} has an unknown parser: ${String(e.parser)}`);
-      continue;
-    }
-    if (seen.has(e.address)) {
-      onInvalid(`duplicate contract address ignored: ${e.address}`);
-      continue;
-    }
-    seen.add(e.address);
-    contracts.push({
-      address: e.address,
-      parser: e.parser as DomainParserId,
-      label: isString(e.label) ? e.label : undefined,
-    });
-  }
-
-  return contracts;
-}
-
-/**
- * Builds a lookup from contract address to its monitored-contract entry. Used to route each
- * event to the appropriate domain parser based on the emitting contract ID (#221).
- */
-export function buildContractRouter(
-  contracts: MonitoredContract[],
-): Map<string, MonitoredContract> {
-  const router = new Map<string, MonitoredContract>();
-  for (const contract of contracts) {
-    router.set(contract.address, contract);
-  }
-  return router;
-}
-
-/**
- * Resolves the monitored contract for an event, or `undefined` when the emitting contract is
- * not configured. Callers can use this to skip unknown contracts without stopping listeners.
- */
-export function routeEvent(
-  router: Map<string, MonitoredContract>,
-  event: RawContractEvent,
-): MonitoredContract | undefined {
-  return router.get(event.contractId);
-}
-
-/**
- * Formats a log prefix identifying the source contract for a log line (#221).
- */
-export function contractLogPrefix(contract: MonitoredContract): string {
-  return `[${contract.label ?? contract.parser}:${contract.address}]`;
-}
+CREATE INDEX IF NOT EXISTS idx_device_tokens_wallet
+  ON device_tokens (wallet_address);
+`;

@@ -43,118 +43,270 @@ export function aggregateOutcomes(answers: Outcome[], options: AggregateOptions 
   };
 }
 
-/** A single price observation from one independent oracle source. */
-export interface PriceSource {
-  /** Stable identifier for the source, e.g. "pyth", "band", "binance". */
-  name: string;
-  /** Observed price in quote units. */
-  price: number;
-  /** Unix timestamp (ms) at which the price was observed. */
-  timestamp: number;
+/**
+ * Redis-backed response cache (#229).
+ *
+ * External price and sports providers rate-limit aggressively, so every upstream query is
+ * memoized in Redis with a short TTL. Cache keys are deterministic (provider + query params)
+ * and any Redis failure degrades gracefully to a direct upstream fetch.
+ */
+
+/** Minimal Redis surface the cache needs; compatible with ioredis / node-redis clients. */
+export interface RedisLike {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, mode: "EX", ttlSeconds: number): Promise<unknown>;
 }
 
-/** Fetches the current price from a single oracle source. */
-export type PriceFetcher = () => Promise<PriceSource>;
+/** TTL for real-time price queries. */
+export const PRICE_CACHE_TTL_SECONDS = 10;
+/** TTL for sports game status queries. */
+export const SPORTS_CACHE_TTL_SECONDS = 60;
 
-export interface PriceAggregatorOptions {
-  /** Minimum number of independent sources required to produce a result. Defaults to 3. */
-  minSources?: number;
-  /** Maximum fractional deviation from the median before a source is rejected. Defaults to 0.03 (3%). */
-  maxDeviation?: number;
-}
-
-export interface PriceProofPayload {
-  /** Verified median price after outlier rejection. */
-  median: number;
-  /** Sources whose prices were accepted into the median. */
-  accepted: PriceSource[];
-  /** Sources rejected as statistical outliers, with their deviation from the median. */
-  rejected: Array<PriceSource & { deviation: number }>;
-  /** Number of independent sources consulted. */
-  sourceCount: number;
-  /** Unix timestamp (ms) at which the aggregation was produced. */
-  timestamp: number;
-}
-
-export type PriceAggregateResult =
-  | { status: "verified"; proof: PriceProofPayload }
-  | { status: "rejected"; reason: string };
-
-/** Computes the median of a numeric list (average of the two middle values for even lengths). */
-function median(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+/** Builds a deterministic cache key from a provider id and its query parameters. */
+export function buildCacheKey(provider: string, params: Record<string, string | number | undefined>): string {
+  const parts = Object.keys(params)
+    .filter((k) => params[k] !== undefined)
+    .sort()
+    .map((k) => `${k}=${encodeURIComponent(String(params[k]))}`);
+  return `oracle:cache:${provider}:${parts.join("&")}`;
 }
 
 /**
- * Multi-source price feed aggregator (#222).
- *
- * Queries independent oracles, computes a trimmed median, rejects sources deviating by more
- * than `maxDeviation` from the median, and returns a proof payload for the market contract.
+ * Returns the cached JSON value for `key`, or runs `fetcher` and caches its result for `ttlSeconds`.
+ * Redis read/write errors are swallowed so callers always fall back to a direct fetch.
  */
-export class PriceAggregator {
-  private readonly fetchers: PriceFetcher[];
-  private readonly minSources: number;
-  private readonly maxDeviation: number;
-
-  constructor(fetchers: PriceFetcher[], options: PriceAggregatorOptions = {}) {
-    this.fetchers = fetchers;
-    this.minSources = options.minSources ?? 3;
-    this.maxDeviation = options.maxDeviation ?? 0.03;
+export async function cachedFetch<T>(
+  redis: RedisLike | undefined,
+  key: string,
+  ttlSeconds: number,
+  fetcher: () => Promise<T>,
+): Promise<T> {
+  if (redis) {
+    try {
+      const hit = await redis.get(key);
+      if (hit !== null) return JSON.parse(hit) as T;
+    } catch {
+      // cache read failed — fall through to a direct fetch
+    }
   }
 
-  /** Collects prices from all sources, tolerating individual source failures. */
-  private async collect(): Promise<PriceSource[]> {
-    const settled = await Promise.allSettled(this.fetchers.map((fetch) => fetch()));
-    const prices: PriceSource[] = [];
-    for (const result of settled) {
-      if (result.status === "fulfilled" && Number.isFinite(result.value.price) && result.value.price > 0) {
-        prices.push(result.value);
-      }
+  const value = await fetcher();
+
+  if (redis) {
+    try {
+      await redis.set(key, JSON.stringify(value), "EX", ttlSeconds);
+    } catch {
+      // cache write failed — the fetched value is still returned
     }
-    return prices;
   }
 
-  /** Aggregates prices and returns a verified median with a proof payload, or a rejection. */
-  async aggregate(): Promise<PriceAggregateResult> {
-    const prices = await this.collect();
-    if (prices.length < this.minSources) {
-      return {
-        status: "rejected",
-        reason: `need at least ${this.minSources} independent sources, got ${prices.length}`,
+  return value;
+}
+
+/**
+ * Sports outcome resolution (#228).
+ *
+ * Resolves professional sports / esports games (EPL, NBA, NFL, ...) into a binary market
+ * outcome using official data providers (Sportsradar, TheRundown). Each provider is wrapped in
+ * a `SportsDataProvider` adapter so the oracle can query game status, final score and the
+ * official winner, and feed the result through the N-of-M consensus gate above.
+ */
+
+export type GameStatus = "scheduled" | "in_progress" | "final" | "postponed" | "cancelled";
+
+export interface GameState {
+  /** Provider game identifier. */
+  gameId: string;
+  status: GameStatus;
+  /** Final scores, present once the game is `final`. */
+  homeScore?: number;
+  awayScore?: number;
+  /** Official winner as reported by the provider, if any. */
+  winner?: "home" | "away" | "draw";
+}
+
+/** A verified sports data source (Sportsradar, TheRundown, or a sandbox mock). */
+export interface SportsDataProvider {
+  readonly name: string;
+  /** Fetches the current game state from the provider's verified endpoint. */
+  getGameState(gameId: string): Promise<GameState>;
+}
+
+export interface SportsMarketTerms {
+  /** Which side the market resolves YES for. */
+  resolvesFor: "home" | "away";
+  /** How a tie is treated. Defaults to `void` (market refunded / escalated). */
+  onTie?: "void" | "no";
+  /** How a postponed or cancelled game is treated. Defaults to `void`. */
+  onPostponed?: "void" | "no";
+  onCancelled?: "void" | "no";
+}
+
+export type SportsResolution =
+  | { status: "resolved"; outcome: Outcome; game: GameState }
+  | { status: "pending"; reason: string; game: GameState }
+  | { status: "void"; reason: string; game: GameState };
+
+/**
+ * Maps a provider game state to a market outcome according to the market terms.
+ * Postponed / cancelled / tie games follow the configured rules instead of resolving blindly.
+ */
+export function resolveSportsOutcome(game: GameState, terms: SportsMarketTerms): SportsResolution {
+  if (game.status === "postponed") {
+    const rule = terms.onPostponed ?? "void";
+    return rule === "void"
+      ? { status: "void", reason: "game postponed", game }
+      : { status: "resolved", outcome: "NO", game };
+  }
+  if (game.status === "cancelled") {
+    const rule = terms.onCancelled ?? "void";
+    return rule === "void"
+      ? { status: "void", reason: "game cancelled", game }
+      : { status: "resolved", outcome: "NO", game };
+  }
+  if (game.status !== "final") {
+    return { status: "pending", reason: `game is ${game.status}`, game };
+  }
+
+  const winner = game.winner ?? deriveWinner(game);
+  if (winner === "draw") {
+    const rule = terms.onTie ?? "void";
+    return rule === "void"
+      ? { status: "void", reason: "game ended in a tie", game }
+      : { status: "resolved", outcome: "NO", game };
+  }
+  return { status: "resolved", outcome: winner === terms.resolvesFor ? "YES" : "NO", game };
+}
+
+function deriveWinner(game: GameState): "home" | "away" | "draw" | undefined {
+  if (game.homeScore === undefined || game.awayScore === undefined) return undefined;
+  if (game.homeScore === game.awayScore) return "draw";
+  return game.homeScore > game.awayScore ? "home" : "away";
+}
+
+/**
+ * Sportsradar adapter. Queries the official `schedules/{gameId}/summary` endpoint and maps the
+ * response into a `GameState`.
+ */
+export class SportsradarAdapter implements SportsDataProvider {
+  readonly name = "sportsradar";
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly baseUrl = "https://api.sportradar.com",
+    private readonly fetchImpl: typeof fetch = fetch,
+    private readonly redis?: RedisLike,
+  ) {}
+
+  async getGameState(gameId: string): Promise<GameState> {
+    const key = buildCacheKey(this.name, { gameId });
+    return cachedFetch(this.redis, key, SPORTS_CACHE_TTL_SECONDS, async () => {
+      const url = `${this.baseUrl}/schedules/${encodeURIComponent(gameId)}/summary.json?api_key=${encodeURIComponent(this.apiKey)}`;
+      const res = await this.fetchImpl(url);
+      if (!res.ok) throw new Error(`sportsradar request failed: ${res.status}`);
+      const body = (await res.json()) as {
+        status?: string;
+        home?: { points?: number };
+        away?: { points?: number };
       };
-    }
-
-    const center = median(prices.map((p) => p.price));
-    const accepted: PriceSource[] = [];
-    const rejected: Array<PriceSource & { deviation: number }> = [];
-    for (const source of prices) {
-      const deviation = Math.abs(source.price - center) / center;
-      if (deviation > this.maxDeviation) {
-        rejected.push({ ...source, deviation });
-      } else {
-        accepted.push(source);
-      }
-    }
-
-    if (accepted.length < this.minSources) {
       return {
-        status: "rejected",
-        reason: `only ${accepted.length} sources within ${this.maxDeviation * 100}% of median`,
+        gameId,
+        status: mapSportsradarStatus(body.status),
+        homeScore: body.home?.points,
+        awayScore: body.away?.points,
       };
-    }
+    });
+  }
+}
 
-    const verifiedMedian = median(accepted.map((p) => p.price));
-    return {
-      status: "verified",
-      proof: {
-        median: verifiedMedian,
-        accepted,
-        rejected,
-        sourceCount: prices.length,
-        timestamp: Date.now(),
-      },
-    };
+function mapSportsradarStatus(status?: string): GameStatus {
+  switch (status) {
+    case "closed":
+    case "complete":
+      return "final";
+    case "inprogress":
+    case "live":
+      return "in_progress";
+    case "postponed":
+      return "postponed";
+    case "canceled":
+    case "cancelled":
+      return "cancelled";
+    default:
+      return "scheduled";
+  }
+}
+
+/**
+ * TheRundown adapter. Queries the official `sports/{sport}/events/{gameId}` endpoint and maps
+ * the response into a `GameState`.
+ */
+export class TheRundownAdapter implements SportsDataProvider {
+  readonly name = "therundown";
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly sport: string,
+    private readonly baseUrl = "https://therundown-therundown-v1.p.rapidapi.com",
+    private readonly fetchImpl: typeof fetch = fetch,
+    private readonly redis?: RedisLike,
+  ) {}
+
+  async getGameState(gameId: string): Promise<GameState> {
+    const key = buildCacheKey(this.name, { sport: this.sport, gameId });
+    return cachedFetch(this.redis, key, SPORTS_CACHE_TTL_SECONDS, async () => {
+      const url = `${this.baseUrl}/sports/${encodeURIComponent(this.sport)}/events/${encodeURIComponent(gameId)}`;
+      const res = await this.fetchImpl(url, {
+        headers: { "X-RapidAPI-Key": this.apiKey },
+      });
+      if (!res.ok) throw new Error(`therundown request failed: ${res.status}`);
+      const body = (await res.json()) as {
+        event?: {
+          status?: string;
+          score?: { event_score_home?: number; event_score_away?: number };
+        };
+      };
+      const event = body.event ?? {};
+      return {
+        gameId,
+        status: mapTheRundownStatus(event.status),
+        homeScore: event.score?.event_score_home,
+        awayScore: event.score?.event_score_away,
+      };
+    });
+  }
+}
+
+function mapTheRundownStatus(status?: string): GameStatus {
+  switch (status) {
+    case "STATUS_FINAL":
+    case "STATUS_FINAL_OT":
+      return "final";
+    case "STATUS_IN_PROGRESS":
+      return "in_progress";
+    case "STATUS_POSTPONED":
+      return "postponed";
+    case "STATUS_CANCELED":
+    case "STATUS_CANCELLED":
+      return "cancelled";
+    default:
+      return "scheduled";
+  }
+}
+
+/** In-memory mock adapter for end-to-end sandbox testing. */
+export class MockSportsAdapter implements SportsDataProvider {
+  readonly name = "mock";
+
+  constructor(private readonly games: Record<string, GameState> = {}) {}
+
+  setGameState(state: GameState): void {
+    this.games[state.gameId] = state;
+  }
+
+  async getGameState(gameId: string): Promise<GameState> {
+    const game = this.games[gameId];
+    if (!game) throw new Error(`unknown mock game: ${gameId}`);
+    return game;
   }
 }
