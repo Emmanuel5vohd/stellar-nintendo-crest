@@ -1,6 +1,8 @@
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
+const crypto = require('crypto');
+const { Keypair, Networks, TransactionBuilder, Transaction, Operation, Account, BASE_FEE } = require('@stellar/stellar-sdk');
 
 const app = express();
 
@@ -53,74 +55,96 @@ app.use(
 
 app.use(express.json());
 
-// --- Dispute evidence IPFS archive storage (issue #231) ---
-// Accepts PNG, JPG, or PDF evidence up to 10MB, pins it to IPFS via Pinata,
-// and returns the resulting CID so it can be saved with the dispute record.
-const EVIDENCE_MAX_BYTES = 10 * 1024 * 1024;
-const EVIDENCE_ALLOWED_TYPES = new Map([
-  ['image/png', 'png'],
-  ['image/jpeg', 'jpg'],
-  ['application/pdf', 'pdf'],
-]);
+// Audit log querying API for security auditors.
+// Reads from the immutable `audit_logs` table (see migration 0011).
+// Supports filtering by actor, action, entity_type, entity_id and time range.
+const AUDIT_LOG_MAX_LIMIT = 200;
+const AUDIT_LOG_DEFAULT_LIMIT = 50;
 
-// Raw body parser scoped to the evidence route so the global JSON parser is untouched.
-app.post(
-  '/api/disputes/evidence',
-  express.raw({ type: () => true, limit: EVIDENCE_MAX_BYTES }),
-  async (req, res) => {
-    const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
-    const extension = EVIDENCE_ALLOWED_TYPES.get(contentType);
+function parseAuditLogFilters(query) {
+  const filters = {};
+  const where = [];
+  const params = [];
 
-    if (!extension) {
-      return res.status(415).json({
-        error: 'Unsupported evidence file type. Allowed types: PNG, JPG, PDF.',
-      });
-    }
+  const addEq = (column, value) => {
+    if (value === undefined || value === null || value === '') return;
+    params.push(value);
+    where.push(`${column} = $${params.length}`);
+  };
 
-    const body = req.body;
-    if (!Buffer.isBuffer(body) || body.length === 0) {
-      return res.status(400).json({ error: 'Evidence file is empty or missing.' });
-    }
+  addEq('actor', query.actor);
+  addEq('action', query.action);
+  addEq('entity_type', query.entity_type);
+  addEq('entity_id', query.entity_id);
 
-    if (body.length > EVIDENCE_MAX_BYTES) {
-      return res.status(413).json({ error: 'Evidence file exceeds the 10MB limit.' });
-    }
-
-    const pinataJwt = process.env.PINATA_JWT;
-    if (!pinataJwt) {
-      return res.status(503).json({ error: 'IPFS pinning service is not configured.' });
-    }
-
-    try {
-      const form = new FormData();
-      form.append('file', new Blob([body], { type: contentType }), `evidence.${extension}`);
-      form.append('pinataMetadata', JSON.stringify({ name: `dispute-evidence-${Date.now()}.${extension}` }));
-
-      const pinataResponse = await fetch('https://api.pinata.cloud/pinning/pinFileToIPFS', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${pinataJwt}` },
-        body: form,
-      });
-
-      if (!pinataResponse.ok) {
-        return res.status(502).json({ error: 'Failed to pin evidence to IPFS.' });
-      }
-
-      const { IpfsHash } = await pinataResponse.json();
-      if (!IpfsHash) {
-        return res.status(502).json({ error: 'IPFS pinning service returned no CID.' });
-      }
-
-      return res.status(201).json({
-        cid: IpfsHash,
-        contentType,
-        size: body.length,
-        gatewayUrl: `https://gateway.pinata.cloud/ipfs/${IpfsHash}`,
-      });
-    } catch (err) {
-      return res.status(502).json({ error: 'Failed to pin evidence to IPFS.' });
-    }
+  if (query.from) {
+    params.push(query.from);
+    where.push(`created_at >= $${params.length}`);
   }
-);
+  if (query.to) {
+    params.push(query.to);
+    where.push(`created_at <= $${params.length}`);
+  }
+
+  let limit = parseInt(query.limit, 10);
+  if (!Number.isFinite(limit) || limit <= 0) limit = AUDIT_LOG_DEFAULT_LIMIT;
+  if (limit > AUDIT_LOG_MAX_LIMIT) limit = AUDIT_LOG_MAX_LIMIT;
+
+  let offset = parseInt(query.offset, 10);
+  if (!Number.isFinite(offset) || offset < 0) offset = 0;
+
+  filters.where = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  filters.params = params;
+  filters.limit = limit;
+  filters.offset = offset;
+  return filters;
+}
+
+app.get('/api/audit-logs', async (req, res, next) => {
+  try {
+    const db = req.app.get('db');
+    if (!db) {
+      return res.status(503).json({ error: 'Database unavailable' });
+    }
+
+    const { where, params, limit, offset } = parseAuditLogFilters(req.query);
+    const listParams = params.concat([limit, offset]);
+    const sql = `
+      SELECT id, actor, action, entity_type, entity_id, ip_address, metadata, created_at
+      FROM audit_logs
+      ${where}
+      ORDER BY created_at DESC, id DESC
+      LIMIT $${listParams.length - 1} OFFSET $${listParams.length}
+    `;
+
+    const { rows } = await db.query(sql, listParams);
+    return res.json({ data: rows, limit, offset });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+app.get('/api/audit-logs/:id', async (req, res, next) => {
+  try {
+    const db = req.app.get('db');
+    if (!db) {
+      return res.status(503).json({ error: 'Database unavailable' });
+    }
+
+    const { rows } = await db.query(
+      `SELECT id, actor, action, entity_type, entity_id, ip_address, metadata, created_at
+       FROM audit_logs WHERE id = $1`,
+      [req.params.id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Audit log entry not found' });
+    }
+    return res.json({ data: rows[0] });
+  } catch (err) {
+    return next(err);
+  }
+});
 
 module.exports = app;
+module.exports.requireAuth = requireAuth;
