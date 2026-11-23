@@ -133,142 +133,41 @@ export function parseEventsOrDeadLetter(
 }
 
 /**
- * IPREDICT SAC token event decoding (#216).
+ * Notification storage schema (#253).
  *
- * The token contract emits SAC-style events whose topic is `transfer` or `mint`. Each decoded
- * event is normalized into a row for the `token_transfers` ledger table so users get an
- * itemized audit trail of token awards. Mint events are attributed to the recipient wallet and
- * carry the associated market ID when the event payload includes one.
- */
-
-export type TokenEventKind = "transfer" | "mint";
-
-export interface TokenTransferRow {
-  kind: TokenEventKind;
-  contractId: string;
-  ledger: number;
-  txHash: string;
-  eventIndex: number;
-  /** Sender wallet; null for mint events (tokens created, no source). */
-  fromWallet: string | null;
-  /** Recipient wallet; for mints this is the awarded user. */
-  toWallet: string;
-  /** Raw token amount as a decimal string to avoid precision loss. */
-  amount: string;
-  /** Market the award relates to, when present on the event. */
-  marketId: string | null;
-}
-
-export type TokenEventParseResult =
-  | { ok: true; row: TokenTransferRow }
-  | { ok: false; reasons: string[] };
-
-const TOKEN_EVENT_KINDS: readonly TokenEventKind[] = ["transfer", "mint"];
-
-const isTokenEventKind = (v: unknown): v is TokenEventKind =>
-  typeof v === "string" && (TOKEN_EVENT_KINDS as readonly string[]).includes(v);
-
-/**
- * Normalizes a token amount to a decimal string. Accepts numbers, bigint, and numeric strings.
- */
-const normalizeAmount = (v: unknown): string | null => {
-  if (typeof v === "bigint") return v.toString();
-  if (typeof v === "number" && Number.isFinite(v)) return String(v);
-  if (typeof v === "string" && v.length > 0 && !Number.isNaN(Number(v))) return v;
-  return null;
-};
-
-/**
- * Decodes a raw token contract event into a `token_transfers` row.
+ * These DDL statements create the tables that remember a user's communication preferences
+ * and their registered push device tokens. Both tables are keyed by the user's wallet
+ * address, which is indexed for instant lookup when an event trigger fires.
  *
- * Expected `value` shape: `{ from?, to, amount, marketId? }`. For `mint` events `from` is
- * ignored and `to` is the awarded wallet. Returns every problem found so the caller can DLQ it.
+ * `user_notification_settings` holds one row per wallet address with boolean toggles for
+ * bet settlement, dispute alerts, and referral commission notifications.
+ *
+ * `device_tokens` enforces a one-to-many relationship between a wallet address and its
+ * push tokens via a foreign key back to `user_notification_settings`.
  */
-export function parseTokenEvent(raw: unknown): TokenEventParseResult {
-  const base = parseContractEvent(raw);
-  if (!base.ok) {
-    return { ok: false, reasons: base.reasons };
-  }
-  const event = base.event;
-  const reasons: string[] = [];
+export const NOTIFICATION_SCHEMA_MIGRATION = `
+CREATE TABLE IF NOT EXISTS user_notification_settings (
+  wallet_address TEXT PRIMARY KEY,
+  bet_settlement_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  dispute_alerts_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  referral_commission_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-  if (!isTokenEventKind(event.topic)) {
-    return { ok: false, reasons: [`unsupported token event topic: ${event.topic}`] };
-  }
-  const kind = event.topic;
+CREATE INDEX IF NOT EXISTS idx_user_notification_settings_wallet
+  ON user_notification_settings (wallet_address);
 
-  if (typeof event.value !== "object" || event.value === null) {
-    return { ok: false, reasons: ["token event value must be an object"] };
-  }
-  const value = event.value as Record<string, unknown>;
+CREATE TABLE IF NOT EXISTS device_tokens (
+  id BIGSERIAL PRIMARY KEY,
+  wallet_address TEXT NOT NULL
+    REFERENCES user_notification_settings (wallet_address) ON DELETE CASCADE,
+  token TEXT NOT NULL,
+  platform TEXT NOT NULL DEFAULT 'unknown',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (wallet_address, token)
+);
 
-  const toWallet = value.to;
-  if (!isString(toWallet)) reasons.push("to wallet must be a non-empty string");
-
-  let fromWallet: string | null = null;
-  if (kind === "transfer") {
-    if (!isString(value.from)) {
-      reasons.push("from wallet must be a non-empty string for transfer events");
-    } else {
-      fromWallet = value.from;
-    }
-  }
-
-  const amount = normalizeAmount(value.amount);
-  if (amount === null) reasons.push("amount must be a numeric value");
-
-  let marketId: string | null = null;
-  if (value.marketId !== undefined && value.marketId !== null) {
-    if (!isString(value.marketId)) {
-      reasons.push("marketId must be a non-empty string when present");
-    } else {
-      marketId = value.marketId;
-    }
-  }
-
-  if (reasons.length > 0) {
-    return { ok: false, reasons };
-  }
-
-  return {
-    ok: true,
-    row: {
-      kind,
-      contractId: event.contractId,
-      ledger: event.ledger,
-      txHash: event.txHash,
-      eventIndex: event.eventIndex,
-      fromWallet,
-      toWallet: toWallet as string,
-      amount: amount as string,
-      marketId,
-    },
-  };
-}
-
-/**
- * Decodes a batch of token events, routing failures to `onDeadLetter` and returning the rows
- * that decoded successfully. Non-token topics are skipped silently so the same stream can carry
- * other contract events.
- */
-export function parseTokenEventsOrDeadLetter(
-  raws: unknown[],
-  onDeadLetter: (raw: unknown, reasons: string[]) => void,
-): TokenTransferRow[] {
-  const rows: TokenTransferRow[] = [];
-  for (const raw of raws) {
-    try {
-      const topic = (raw as Record<string, unknown> | null)?.topic;
-      if (!isTokenEventKind(topic)) continue;
-      const result = parseTokenEvent(raw);
-      if (result.ok) {
-        rows.push(result.row);
-      } else {
-        onDeadLetter(raw, result.reasons);
-      }
-    } catch (err) {
-      onDeadLetter(raw, [`token parser threw: ${String(err)}`]);
-    }
-  }
-  return rows;
-}
+CREATE INDEX IF NOT EXISTS idx_device_tokens_wallet
+  ON device_tokens (wallet_address);
+`;

@@ -277,97 +277,16 @@ export function buildUserEventRouter(
 }
 
 /**
- * A decoded IPREDICT SAC token event (#216). `transfer` moves tokens between wallets, `mint`
- * awards new tokens to a recipient. `marketId` is present when the event can be attributed to
- * a specific market (e.g. a mint triggered by a market resolution).
+ * Builds the router with the market handlers wired in (#241): a new bet invalidates the cached
+ * market stats so the next odds query recomputes from the database and repopulates Redis.
  */
-export interface TokenEvent {
-  kind: "transfer" | "mint";
-  from: string | null;
-  to: string;
-  amount: bigint;
-  marketId: string | null;
-}
-
-/**
- * Decodes a raw SAC-style token event into a `TokenEvent` (#216). Returns `null` when the event
- * is not a token `transfer`/`mint` event or its payload is malformed, so callers can skip it.
- *
- * Expected payload shape: `{ from?, to, amount, marketId? }` where `amount` is a decimal string
- * or number. `mint` events have no `from`; `transfer` events require one.
- */
-export function decodeTokenEvent(event: RawContractEvent): TokenEvent | null {
-  if (event.topic !== "transfer" && event.topic !== "mint") {
-    return null;
-  }
-
-  const payload = event.data as Record<string, unknown> | null | undefined;
-  if (!payload || typeof payload !== "object") {
-    return null;
-  }
-
-  const to = payload.to;
-  if (typeof to !== "string" || to.length === 0) {
-    return null;
-  }
-
-  const rawAmount = payload.amount;
-  let amount: bigint;
-  try {
-    if (typeof rawAmount === "bigint") {
-      amount = rawAmount;
-    } else if (typeof rawAmount === "string" && rawAmount.length > 0) {
-      amount = BigInt(rawAmount);
-    } else if (typeof rawAmount === "number" && Number.isFinite(rawAmount)) {
-      amount = BigInt(Math.trunc(rawAmount));
-    } else {
-      return null;
-    }
-  } catch {
-    return null;
-  }
-
-  const rawFrom = payload.from;
-  const from = typeof rawFrom === "string" && rawFrom.length > 0 ? rawFrom : null;
-  if (event.topic === "transfer" && from === null) {
-    return null;
-  }
-
-  const rawMarketId = payload.marketId;
-  const marketId =
-    typeof rawMarketId === "string" && rawMarketId.length > 0 ? rawMarketId : null;
-
-  return { kind: event.topic, from, to, amount, marketId };
-}
-
-/**
- * Builds the router with the IPREDICT token handlers wired in (#216): `transfer` and `mint`
- * events are decoded and handed to the caller-supplied ledger writer, which persists them to
- * the `token_transfers` table. Undecodable token events are written to the DLQ (#218) when a
- * writer is supplied, otherwise reported via `onUnmapped`.
- */
-export function buildTokenEventRouter(
+export function buildMarketEventRouter(
   handlers: {
-    recordTokenEvent: (event: TokenEvent) => Promise<void>;
+    betPlaced: EventHandler;
   },
   onUnmapped: UnmappedHandler,
-  dlqWriter?: DlqWriter,
-  telemetryWriter?: TxTelemetryWriter,
 ): EventRouter {
-  const router = new EventRouter(onUnmapped, dlqWriter, telemetryWriter);
-  const route = async (event: RawContractEvent): Promise<void> => {
-    const decoded = decodeTokenEvent(event);
-    if (!decoded) {
-      if (dlqWriter) {
-        await dlqWriter(toDlqEntry(event, new Error("undecodable token event")));
-      } else {
-        onUnmapped(event);
-      }
-      return;
-    }
-    await handlers.recordTokenEvent(decoded);
-  };
-  router.register("transfer", route);
-  router.register("mint", route);
+  const router = new EventRouter(onUnmapped);
+  router.register("bet_placed", handlers.betPlaced);
   return router;
 }
