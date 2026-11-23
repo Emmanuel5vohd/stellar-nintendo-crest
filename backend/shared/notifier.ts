@@ -5,7 +5,14 @@
  * #oracle-disputes, #audit-events) with severity color bars and direct links
  * back to the web UI. Includes a token-bucket rate limiter so alert storms do
  * not flood the channels.
+ *
+ * Also provides user-facing webhook notifications for bet outcomes and
+ * referral earnings. Outgoing payloads are signed with an HMAC-SHA256
+ * signature header derived from a per-user shared secret, and failed
+ * deliveries are retried up to 5 times with exponential backoff.
  */
+
+import { createHmac } from 'crypto';
 
 export type AlertSeverity = 'critical' | 'high' | 'medium' | 'low';
 
@@ -36,6 +43,40 @@ export interface NotifierConfig {
   rateLimit?: number;
   /** Rate-limit window in milliseconds. Defaults to 60_000. */
   rateLimitWindowMs?: number;
+}
+
+/**
+ * Per-user communication preferences, keyed by Stellar wallet address.
+ * Mirrors the `user_notification_settings` table (one row per wallet).
+ */
+export interface UserNotificationSettings {
+  /** Stellar wallet address (primary key). */
+  walletAddress: string;
+  /** Notify when a bet is settled. */
+  betSettlement: boolean;
+  /** Notify when a dispute is raised or resolved. */
+  disputeAlerts: boolean;
+  /** Notify when a referral commission is credited. */
+  referralCommission: boolean;
+  /** Deliver alerts via email. */
+  emailEnabled: boolean;
+  /** Deliver alerts via push notification. */
+  pushEnabled: boolean;
+}
+
+/**
+ * A registered push notification token for a wallet address.
+ * Mirrors the `device_tokens` table (many tokens per wallet).
+ */
+export interface DeviceToken {
+  /** Stellar wallet address (foreign key to user_notification_settings). */
+  walletAddress: string;
+  /** Opaque push registration token issued by the platform. */
+  token: string;
+  /** Platform that issued the token. */
+  platform: 'ios' | 'android' | 'web';
+  /** ISO timestamp of registration. */
+  createdAt: string;
 }
 
 /** Severity color bars (decimal RGB) used for the embed side stripe. */
@@ -103,6 +144,38 @@ export class AlertNotifier {
     }
   }
 
+  /**
+   * Notify the operations team that the dispute bot submitted a challenge.
+   * Routes to the dedicated #oracle-disputes channel with the market, the
+   * proposed vs. canonical outcome, and the posted challenge bond.
+   */
+  async notifyChallengeSubmitted(params: {
+    marketId: string;
+    proposedOutcome: string;
+    canonicalOutcome: string;
+    discrepancyBps: number;
+    bondAmount: string;
+    txHash?: string;
+  }): Promise<boolean> {
+    return this.notify({
+      title: `Dispute challenge submitted for market ${params.marketId}`,
+      message:
+        `Automated dispute bot challenged a proposed outcome that contradicts ` +
+        `the canonical price feed (discrepancy ${params.discrepancyBps} bps).`,
+      severity: 'high',
+      channel: 'oracle-disputes',
+      link: `/markets/${params.marketId}`,
+      fields: {
+        'Market': params.marketId,
+        'Proposed outcome': params.proposedOutcome,
+        'Canonical outcome': params.canonicalOutcome,
+        'Discrepancy (bps)': params.discrepancyBps,
+        'Challenge bond': params.bondAmount,
+        ...(params.txHash ? { 'Tx hash': params.txHash } : {}),
+      },
+    });
+  }
+
   /** Token-bucket style limiter: at most `rateLimit` alerts per window. */
   private allow(channel: AlertChannel): boolean {
     const now = Date.now();
@@ -155,183 +228,140 @@ export function createAlertNotifier(config: NotifierConfig): AlertNotifier {
   return new AlertNotifier(config);
 }
 
-/**
- * Minimum oracle relayer wallet XLM reserve before a low-balance alert fires.
- * Below this the relayer may not be able to pay gas for automated submissions.
- */
-export const ORACLE_MIN_XLM_RESERVE = 100;
+// ---------------------------------------------------------------------------
+// User webhook notifications (bet outcomes + referral earnings)
+// ---------------------------------------------------------------------------
 
-/**
- * Minimum escrowed challenge bond capacity (in XLM) before a depletion alert
- * fires. When the escrow can no longer cover new challenge bonds, disputes
- * cannot be opened and resolutions stall.
- */
-export const ORACLE_MIN_BOND_CAPACITY = 100;
+export type UserNotificationEvent = 'bet.won' | 'referral.commission';
 
-/** Snapshot of the oracle treasury balances used by the monitor. */
-export interface OracleTreasurySnapshot {
-  /** Relayer wallet XLM balance available for gas fees. */
-  walletXlm: number;
-  /** Escrowed challenge bond capacity remaining, in XLM. */
-  bondCapacityXlm: number;
-  /** Optional ISO timestamp of when the snapshot was taken. */
-  timestamp?: string;
+export interface UserWebhookRegistration {
+  /** Destination URL the user registered in settings. */
+  url: string;
+  /** Shared secret used to sign outgoing payloads (HMAC-SHA256). */
+  secret: string;
+  /** Whether the registration is currently active. */
+  enabled: boolean;
 }
 
-/** Result of a single treasury balance evaluation. */
-export interface OracleTreasuryEvaluation {
-  walletLow: boolean;
-  bondDepleted: boolean;
-  /** True when either the wallet or bond capacity is below threshold. */
-  needsReplenishment: boolean;
-  /** XLM required to restore the wallet to the minimum reserve (0 if healthy). */
-  walletTopUpXlm: number;
-  /** XLM required to restore bond capacity to the minimum (0 if healthy). */
-  bondTopUpXlm: number;
+export interface UserNotificationPayload {
+  event: UserNotificationEvent;
+  /** ISO timestamp of when the event occurred. */
+  occurredAt: string;
+  /** Event-specific data (bet id, amount, currency, etc.). */
+  data: Record<string, unknown>;
 }
 
-/**
- * Evaluate a treasury snapshot against the configured thresholds. Pure helper
- * so it can be reused by the periodic monitor and by metrics endpoints.
- */
-export function evaluateOracleTreasury(
-  snapshot: OracleTreasurySnapshot,
-  thresholds: { minWalletXlm?: number; minBondCapacityXlm?: number } = {},
-): OracleTreasuryEvaluation {
-  const minWallet = thresholds.minWalletXlm ?? ORACLE_MIN_XLM_RESERVE;
-  const minBond = thresholds.minBondCapacityXlm ?? ORACLE_MIN_BOND_CAPACITY;
+/** Header carrying the hex HMAC-SHA256 signature of the raw request body. */
+export const SIGNATURE_HEADER = 'X-HandsOff-Signature';
 
-  const walletLow = snapshot.walletXlm < minWallet;
-  const bondDepleted = snapshot.bondCapacityXlm < minBond;
+/** Maximum number of delivery attempts (initial + retries). */
+export const MAX_DELIVERY_ATTEMPTS = 5;
 
-  return {
-    walletLow,
-    bondDepleted,
-    needsReplenishment: walletLow || bondDepleted,
-    walletTopUpXlm: walletLow ? Math.max(0, minWallet - snapshot.walletXlm) : 0,
-    bondTopUpXlm: bondDepleted ? Math.max(0, minBond - snapshot.bondCapacityXlm) : 0,
-  };
+/** Base backoff delay in milliseconds; doubled on each retry. */
+export const BASE_BACKOFF_MS = 1_000;
+
+/** Compute the hex HMAC-SHA256 signature for a raw payload body. */
+export function signPayload(secret: string, body: string): string {
+  return createHmac('sha256', secret).update(body).digest('hex');
+}
+
+/** Exponential backoff delay for a given (1-based) attempt number. */
+export function backoffDelayMs(attempt: number): number {
+  return BASE_BACKOFF_MS * 2 ** Math.max(0, attempt - 1);
 }
 
 /**
- * Hook invoked when the treasury needs replenishment. Implementations may
- * trigger an automated top-up transfer; the monitor awaits the result so
- * failures can be surfaced to the monitoring channel.
+ * In-memory registry of user webhook registrations, keyed by user id.
+ * Backed by user settings in production; kept minimal here so the delivery
+ * worker can be exercised independently.
  */
-export type AutoReplenishHook = (
-  evaluation: OracleTreasuryEvaluation,
-  snapshot: OracleTreasurySnapshot,
-) => Promise<void> | void;
+export class UserWebhookRegistry {
+  private readonly registrations = new Map<string, UserWebhookRegistration>();
 
-/**
- * Periodic oracle treasury monitor. Checks the relayer wallet XLM balance and
- * escrowed challenge bond capacity, dispatches alerts to the monitoring
- * channel when either drops below threshold, and invokes the auto-replenish
- * hook so automated top-ups can be triggered.
- */
-export class OracleTreasuryMonitor {
-  private readonly notifier: AlertNotifier;
-  private readonly getSnapshot: () => Promise<OracleTreasurySnapshot>;
-  private readonly onReplenish?: AutoReplenishHook;
-  private readonly minWalletXlm: number;
-  private readonly minBondCapacityXlm: number;
-  private timer?: ReturnType<typeof setInterval>;
-  private lastEvaluation?: OracleTreasuryEvaluation;
-
-  constructor(options: {
-    notifier: AlertNotifier;
-    getSnapshot: () => Promise<OracleTreasurySnapshot>;
-    onReplenish?: AutoReplenishHook;
-    minWalletXlm?: number;
-    minBondCapacityXlm?: number;
-  }) {
-    this.notifier = options.notifier;
-    this.getSnapshot = options.getSnapshot;
-    this.onReplenish = options.onReplenish;
-    this.minWalletXlm = options.minWalletXlm ?? ORACLE_MIN_XLM_RESERVE;
-    this.minBondCapacityXlm = options.minBondCapacityXlm ?? ORACLE_MIN_BOND_CAPACITY;
+  /** Register or replace the webhook URL + secret for a user. */
+  register(userId: string, url: string, secret: string): UserWebhookRegistration {
+    const registration: UserWebhookRegistration = { url, secret, enabled: true };
+    this.registrations.set(userId, registration);
+    return registration;
   }
 
-  /** Run a single balance check, alerting and triggering top-ups as needed. */
-  async check(): Promise<OracleTreasuryEvaluation> {
-    const snapshot = await this.getSnapshot();
-    const evaluation = evaluateOracleTreasury(snapshot, {
-      minWalletXlm: this.minWalletXlm,
-      minBondCapacityXlm: this.minBondCapacityXlm,
-    });
-    this.lastEvaluation = evaluation;
+  /** Remove a user's webhook registration. Returns true when one existed. */
+  remove(userId: string): boolean {
+    return this.registrations.delete(userId);
+  }
 
-    if (evaluation.walletLow) {
-      await this.notifier.notify({
-        title: 'Oracle relayer wallet low on XLM',
-        message: `Relayer wallet holds ${snapshot.walletXlm} XLM, below the ${this.minWalletXlm} XLM reserve. Automated submissions may stall.`,
-        severity: 'critical',
-        channel: 'alerts-critical',
-        fields: {
-          'Wallet XLM': snapshot.walletXlm,
-          'Min reserve': this.minWalletXlm,
-          'Top-up needed': evaluation.walletTopUpXlm,
-        },
-        timestamp: snapshot.timestamp,
-      });
+  /** Fetch a user's registration, if any. */
+  get(userId: string): UserWebhookRegistration | undefined {
+    return this.registrations.get(userId);
+  }
+}
+
+/**
+ * Delivery worker that signs and POSTs user notifications, retrying failed
+ * deliveries up to {@link MAX_DELIVERY_ATTEMPTS} times with exponential
+ * backoff.
+ */
+export class UserNotificationWorker {
+  constructor(
+    private readonly registry: UserWebhookRegistry,
+    private readonly sleep: (ms: number) => Promise<void> = (ms) =>
+      new Promise((resolve) => setTimeout(resolve, ms)),
+  ) {}
+
+  /**
+   * Deliver a notification to a user's registered webhook. Returns true when
+   * a delivery succeeded, false when the user has no active webhook or all
+   * attempts failed.
+   */
+  async deliver(userId: string, payload: UserNotificationPayload): Promise<boolean> {
+    const registration = this.registry.get(userId);
+    if (!registration || !registration.enabled) {
+      return false;
     }
 
-    if (evaluation.bondDepleted) {
-      await this.notifier.notify({
-        title: 'Oracle challenge bond capacity depleted',
-        message: `Escrowed challenge bond capacity is ${snapshot.bondCapacityXlm} XLM, below the ${this.minBondCapacityXlm} XLM minimum. New disputes cannot be bonded.`,
-        severity: 'high',
-        channel: 'oracle-disputes',
-        fields: {
-          'Bond capacity': snapshot.bondCapacityXlm,
-          'Min capacity': this.minBondCapacityXlm,
-          'Top-up needed': evaluation.bondTopUpXlm,
-        },
-        timestamp: snapshot.timestamp,
-      });
-    }
+    const body = JSON.stringify(payload);
+    const signature = signPayload(registration.secret, body);
 
-    if (evaluation.needsReplenishment && this.onReplenish) {
+    for (let attempt = 1; attempt <= MAX_DELIVERY_ATTEMPTS; attempt += 1) {
       try {
-        await this.onReplenish(evaluation, snapshot);
-      } catch (err) {
-        await this.notifier.notify({
-          title: 'Oracle auto-replenishment failed',
-          message: `Auto-replenishment hook threw: ${err instanceof Error ? err.message : String(err)}`,
-          severity: 'critical',
-          channel: 'alerts-critical',
-          timestamp: snapshot.timestamp,
+        const res = await fetch(registration.url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            [SIGNATURE_HEADER]: signature,
+          },
+          body,
         });
+        if (res.ok) {
+          return true;
+        }
+      } catch {
+        // Network error: fall through to retry.
+      }
+
+      if (attempt < MAX_DELIVERY_ATTEMPTS) {
+        await this.sleep(backoffDelayMs(attempt));
       }
     }
 
-    return evaluation;
+    return false;
   }
 
-  /** Start periodic balance checks. No-op if already running. */
-  start(intervalMs = 60_000): void {
-    if (this.timer) {
-      return;
-    }
-    this.timer = setInterval(() => {
-      void this.check().catch(() => undefined);
-    }, intervalMs);
-    // Do not keep the process alive solely for the monitor.
-    if (typeof this.timer === 'object' && this.timer && 'unref' in this.timer) {
-      (this.timer as { unref: () => void }).unref();
-    }
+  /** Notify a user that one of their bets resolved as a winner. */
+  async notifyBetWon(userId: string, data: Record<string, unknown>): Promise<boolean> {
+    return this.deliver(userId, {
+      event: 'bet.won',
+      occurredAt: new Date().toISOString(),
+      data,
+    });
   }
 
-  /** Stop periodic balance checks. */
-  stop(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = undefined;
-    }
-  }
-
-  /** Latest evaluation, exposed for the metrics endpoint. */
-  getLastEvaluation(): OracleTreasuryEvaluation | undefined {
-    return this.lastEvaluation;
+  /** Notify a user that they earned a referral commission. */
+  async notifyReferralCommission(userId: string, data: Record<string, unknown>): Promise<boolean> {
+    return this.deliver(userId, {
+      event: 'referral.commission',
+      occurredAt: new Date().toISOString(),
+      data,
+    });
   }
 }

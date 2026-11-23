@@ -2,6 +2,8 @@ const crypto = require('crypto');
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
+const crypto = require('crypto');
+const { Keypair, Networks, TransactionBuilder, Transaction, Operation, Account, BASE_FEE } = require('@stellar/stellar-sdk');
 
 const app = express();
 
@@ -57,60 +59,96 @@ app.use(
 
 app.use(express.json());
 
-function computeOracleSignature(secret, timestamp, rawBody) {
-  return crypto
-    .createHmac('sha256', secret)
-    .update(`${timestamp}.${rawBody}`)
-    .digest('hex');
+// Audit log querying API for security auditors.
+// Reads from the immutable `audit_logs` table (see migration 0011).
+// Supports filtering by actor, action, entity_type, entity_id and time range.
+const AUDIT_LOG_MAX_LIMIT = 200;
+const AUDIT_LOG_DEFAULT_LIMIT = 50;
+
+function parseAuditLogFilters(query) {
+  const filters = {};
+  const where = [];
+  const params = [];
+
+  const addEq = (column, value) => {
+    if (value === undefined || value === null || value === '') return;
+    params.push(value);
+    where.push(`${column} = $${params.length}`);
+  };
+
+  addEq('actor', query.actor);
+  addEq('action', query.action);
+  addEq('entity_type', query.entity_type);
+  addEq('entity_id', query.entity_id);
+
+  if (query.from) {
+    params.push(query.from);
+    where.push(`created_at >= $${params.length}`);
+  }
+  if (query.to) {
+    params.push(query.to);
+    where.push(`created_at <= $${params.length}`);
+  }
+
+  let limit = parseInt(query.limit, 10);
+  if (!Number.isFinite(limit) || limit <= 0) limit = AUDIT_LOG_DEFAULT_LIMIT;
+  if (limit > AUDIT_LOG_MAX_LIMIT) limit = AUDIT_LOG_MAX_LIMIT;
+
+  let offset = parseInt(query.offset, 10);
+  if (!Number.isFinite(offset) || offset < 0) offset = 0;
+
+  filters.where = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  filters.params = params;
+  filters.limit = limit;
+  filters.offset = offset;
+  return filters;
 }
 
-function safeCompare(a, b) {
-  const bufA = Buffer.from(String(a));
-  const bufB = Buffer.from(String(b));
-  if (bufA.length !== bufB.length) {
-    return false;
+app.get('/api/audit-logs', async (req, res, next) => {
+  try {
+    const db = req.app.get('db');
+    if (!db) {
+      return res.status(503).json({ error: 'Database unavailable' });
+    }
+
+    const { where, params, limit, offset } = parseAuditLogFilters(req.query);
+    const listParams = params.concat([limit, offset]);
+    const sql = `
+      SELECT id, actor, action, entity_type, entity_id, ip_address, metadata, created_at
+      FROM audit_logs
+      ${where}
+      ORDER BY created_at DESC, id DESC
+      LIMIT $${listParams.length - 1} OFFSET $${listParams.length}
+    `;
+
+    const { rows } = await db.query(sql, listParams);
+    return res.json({ data: rows, limit, offset });
+  } catch (err) {
+    return next(err);
   }
-  return crypto.timingSafeEqual(bufA, bufB);
-}
+});
 
-function verifyOracleSignature(req, res, next) {
-  const signatureHeader = req.get('X-Oracle-Signature');
-  const timestampHeader = req.get('X-Oracle-Timestamp');
+app.get('/api/audit-logs/:id', async (req, res, next) => {
+  try {
+    const db = req.app.get('db');
+    if (!db) {
+      return res.status(503).json({ error: 'Database unavailable' });
+    }
 
-  if (!signatureHeader || !timestampHeader) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    const { rows } = await db.query(
+      `SELECT id, actor, action, entity_type, entity_id, ip_address, metadata, created_at
+       FROM audit_logs WHERE id = $1`,
+      [req.params.id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Audit log entry not found' });
+    }
+    return res.json({ data: rows[0] });
+  } catch (err) {
+    return next(err);
   }
-
-  const match = /^sha256=([a-f0-9]{64})$/i.exec(signatureHeader.trim());
-  if (!match) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const timestamp = Number(timestampHeader);
-  if (!Number.isFinite(timestamp)) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const nowSeconds = Math.floor(Date.now() / 1000);
-  if (Math.abs(nowSeconds - timestamp) > ORACLE_TIMESTAMP_TOLERANCE_SECONDS) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  if (!ORACLE_HMAC_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  const rawBody = req.rawBody !== undefined ? req.rawBody : JSON.stringify(req.body || {});
-  const expected = computeOracleSignature(ORACLE_HMAC_SECRET, timestampHeader, rawBody);
-
-  if (!safeCompare(expected, match[1].toLowerCase())) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  return next();
-}
-
-app.verifyOracleSignature = verifyOracleSignature;
-app.computeOracleSignature = computeOracleSignature;
+});
 
 module.exports = app;
+module.exports.requireAuth = requireAuth;

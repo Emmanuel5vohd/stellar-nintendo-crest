@@ -6,9 +6,9 @@
  * is matched against the market's two candidates. A single feed, two feeds that disagree, or a
  * feed that names neither candidate, leaves the market for manual resolution.
  *
- * Expiration timestamps (#226) are resolved strictly to UTC Unix epoch seconds: ISO 8601 strings
- * must carry an explicit UTC offset (`Z` or `±HH:MM`) and numeric epoch seconds are accepted as-is.
- * Ambiguous local time strings and invalid/out-of-range dates are rejected.
+ * External feed fetches are cached in Redis (#229) with a short TTL so high-frequency dispute
+ * checks do not trip provider rate limits. Cache keys are deterministic and include the provider
+ * identifier plus the query parameters. Any Redis miss or error falls back to a direct fetch.
  */
 
 import type { Outcome } from "../auto-submitter";
@@ -28,39 +28,57 @@ export interface MarketCandidates {
 
 export const MIN_CONFIRMATIONS = 2;
 
+/** TTL for cached election feed responses, in seconds. */
+export const ELECTION_FEED_TTL_SECONDS = 60;
+
+/** Minimal Redis surface used for caching; compatible with ioredis / node-redis clients. */
+export interface RedisCache {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, mode: "EX", ttl: number): Promise<unknown>;
+}
+
+/** Fetches a single provider's election feed payload. */
+export type ElectionFeedFetcher = (source: string, race: string) => Promise<ElectionFeedPayload>;
+
 const normalise = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
 
-/** ISO 8601 with an explicit UTC offset: `Z` or `±HH:MM` (optionally `±HHMM`). */
-const ISO_WITH_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})$/i;
+/** Deterministic cache key: provider identifier + normalised query parameters. */
+export function electionFeedCacheKey(source: string, race: string): string {
+  return `oracle:politics:feed:${normalise(source)}:${normalise(race)}`;
+}
 
 /**
- * Resolves a market expiration timestamp to UTC Unix epoch seconds.
- *
- * Accepts numeric epoch seconds or ISO 8601 strings with an explicit UTC offset. Rejects
- * ambiguous local time strings (no offset) and invalid/out-of-range dates so market resolution
- * comparisons never drift across timezones or daylight saving transitions.
+ * Fetches an election feed through Redis, falling back to a direct fetch on cache miss or Redis
+ * failure. Successful direct fetches are written back to the cache with `ELECTION_FEED_TTL_SECONDS`.
  */
-export function resolveExpirationUtc(value: string | number): number {
-  if (typeof value === "number") {
-    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
-      throw new Error(`invalid epoch seconds: ${value}`);
+export async function fetchElectionFeedCached(
+  source: string,
+  race: string,
+  fetcher: ElectionFeedFetcher,
+  redis?: RedisCache,
+): Promise<ElectionFeedPayload> {
+  const key = electionFeedCacheKey(source, race);
+
+  if (redis) {
+    try {
+      const cached = await redis.get(key);
+      if (cached) return JSON.parse(cached) as ElectionFeedPayload;
+    } catch {
+      // Redis unavailable — fall through to a direct fetch.
     }
-    return value;
   }
 
-  const trimmed = value.trim();
-  if (/^\d+$/.test(trimmed)) {
-    return resolveExpirationUtc(Number(trimmed));
-  }
-  if (!ISO_WITH_OFFSET.test(trimmed)) {
-    throw new Error(`ambiguous or invalid timestamp (explicit UTC offset required): ${value}`);
+  const payload = await fetcher(source, race);
+
+  if (redis) {
+    try {
+      await redis.set(key, JSON.stringify(payload), "EX", ELECTION_FEED_TTL_SECONDS);
+    } catch {
+      // Cache write failures must not break resolution.
+    }
   }
 
-  const ms = Date.parse(trimmed);
-  if (!Number.isFinite(ms)) {
-    throw new Error(`invalid timestamp: ${value}`);
-  }
-  return Math.floor(ms / 1000);
+  return payload;
 }
 
 /** Maps a declared winner to the market outcome, or `undefined` when it matches neither candidate. */
@@ -95,4 +113,70 @@ export function resolveElection(market: MarketCandidates, feeds: ElectionFeedPay
     return { status: "manual", reason: `need ${MIN_CONFIRMATIONS} certified feeds from distinct sources` };
   }
   return { status: "resolved", outcome: outcomes[0], confirmedBy: [...bySource.keys()] };
+}
+
+/**
+ * Multi-source price feed aggregation (#222).
+ *
+ * Prices are collected from independent oracles (Pyth, Band, Binance REST) and combined with a
+ * trimmed median. Any source deviating by more than `MAX_DEVIATION` from the median is discarded
+ * as an outlier before the verified median is submitted to the market contract with a proof payload.
+ */
+
+export const MIN_PRICE_SOURCES = 3;
+export const MAX_DEVIATION = 0.03;
+
+export interface PriceSource {
+  source: string;
+  price: number;
+}
+
+export interface PriceProofPayload {
+  median: number;
+  sources: PriceSource[];
+  rejected: PriceSource[];
+  timestamp: number;
+}
+
+export type AggregationResult =
+  | { status: "verified"; median: number; proof: PriceProofPayload }
+  | { status: "manual"; reason: string };
+
+const median = (values: number[]): number => {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+};
+
+/**
+ * Aggregates prices from independent sources, rejecting outliers beyond `MAX_DEVIATION` of the
+ * median. Requires at least `MIN_PRICE_SOURCES` valid sources to produce a verified median.
+ */
+export function aggregatePrices(prices: PriceSource[], timestamp = Date.now()): AggregationResult {
+  const valid = prices.filter((p) => Number.isFinite(p.price) && p.price > 0);
+  if (valid.length < MIN_PRICE_SOURCES) {
+    return { status: "manual", reason: `need ${MIN_PRICE_SOURCES} valid price sources` };
+  }
+
+  const rawMedian = median(valid.map((p) => p.price));
+  const accepted: PriceSource[] = [];
+  const rejected: PriceSource[] = [];
+  for (const p of valid) {
+    if (Math.abs(p.price - rawMedian) / rawMedian <= MAX_DEVIATION) {
+      accepted.push(p);
+    } else {
+      rejected.push(p);
+    }
+  }
+
+  if (accepted.length < MIN_PRICE_SOURCES) {
+    return { status: "manual", reason: `only ${accepted.length} sources within ${MAX_DEVIATION * 100}% of median` };
+  }
+
+  const verifiedMedian = median(accepted.map((p) => p.price));
+  return {
+    status: "verified",
+    median: verifiedMedian,
+    proof: { median: verifiedMedian, sources: accepted, rejected, timestamp },
+  };
 }
