@@ -21,6 +21,26 @@ export interface BetPlacedEvent {
   grossAmount: bigint;
   netAmount: bigint;
   timestamp: Date;
+  /** Contract method invoked by the transaction (e.g. `place_bet`). */
+  contractMethod?: string;
+  /** Resource telemetry parsed from the transaction envelope result (#219). */
+  telemetry?: TxTelemetry;
+}
+
+/**
+ * Per-transaction gas/resource telemetry (#219). Parsed from the transaction envelope result
+ * and stored alongside the bet/market records so protocol developers can track gas trends.
+ */
+export interface TxTelemetry {
+  cpuInstructions: bigint;
+  ramBytes: bigint;
+  feeStroops: bigint;
+}
+
+export interface TxTelemetryRow extends TxTelemetry {
+  txHash: string;
+  eventIndex: number;
+  contractMethod: string;
 }
 
 export interface BetRow {

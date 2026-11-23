@@ -1,23 +1,81 @@
-/**
- * Batched writes for one ledger (#31).
- *
- * Instead of committing each event alone, the events of a ledger are written together: one
- * multi-row upsert per table, inside one transaction. If any write fails, the whole ledger
- * rolls back, so a ledger is never half applied.
- */
+import { Pool, PoolClient } from 'pg';
+import { logger } from '../utils/logger';
 
-export interface LedgerWrite {
-  table: string;
-  key: string;
-  row: Record<string, unknown>;
+/**
+ * PostgreSQL connection pool for the indexer runner.
+ *
+ * Tuned for high event burst loads (hundreds of concurrent bet events):
+ * - min 5 warm connections to absorb sudden bursts without handshake latency
+ * - max 30 connections to bound server-side resource usage
+ * - 5000ms statement timeout so runaway queries fail fast instead of
+ *   holding a connection and starving the pool
+ * - 10000ms idle timeout to reclaim connections after bursts subside
+ */
+export const pool = new Pool({
+  min: 5,
+  max: 30,
+  idleTimeoutMillis: 10000,
+  statement_timeout: 5000,
+  query_timeout: 5000,
+  connectionTimeoutMillis: 5000,
+});
+
+pool.on('error', (err) => {
+  logger.error('Unexpected error on idle PostgreSQL client', { error: err.message });
+});
+
+const MAX_POOL_RETRIES = 3;
+const POOL_RETRY_BASE_DELAY_MS = 100;
+
+function isPoolSaturationError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    message.includes('timeout exceeded when trying to connect') ||
+    message.includes('too many clients already') ||
+    message.includes('remaining connection slots are reserved') ||
+    message.includes('Connection terminated')
+  );
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Acquire a client from the pool, retrying with exponential backoff when the
+ * pool is transiently saturated. Throws the last error if all retries fail.
+ */
+async function acquireClient(): Promise<PoolClient> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_POOL_RETRIES; attempt++) {
+    try {
+      return await pool.connect();
+    } catch (err) {
+      lastError = err;
+      if (!isPoolSaturationError(err) || attempt === MAX_POOL_RETRIES) {
+        break;
+      }
+      const backoff = POOL_RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+      logger.warn('PostgreSQL pool saturated, retrying connection', {
+        attempt: attempt + 1,
+        backoffMs: backoff,
+      });
+      await delay(backoff);
+    }
+  }
+  throw lastError;
 }
 export interface BatchStoreTx {
   /** Multi-row `INSERT ... ON CONFLICT DO UPDATE` for one table. */
   upsertMany(table: string, rows: Record<string, unknown>[]): Promise<void>;
 }
 
-export interface BatchStore {
-  transaction<T>(work: (tx: BatchStoreTx) => Promise<T>): Promise<T>;
+export interface LedgerBatchEntry {
+  eventId: string;
+  tokenAddress: string;
+  amount: string;
+  ledger: number;
+  timestamp: Date;
 }
 
 /**
@@ -72,14 +130,9 @@ function orderForLocking(table: string, rows: Record<string, unknown>[]): Record
  * callers and no query changes are required. Lock-ordered tables are sorted by their lock key so
  * concurrent transactions acquire row locks deterministically and cannot deadlock (#254).
  */
-export async function flushLedgerBatch(store: BatchStore, writes: LedgerWrite[]): Promise<void> {
-  if (writes.length === 0) return;
-
-  const byTable = new Map<string, Record<string, unknown>[]>();
-  for (const w of writes) {
-    const rows = byTable.get(w.table) ?? [];
-    rows.push(w.row);
-    byTable.set(w.table, rows);
+export async function persistLedgerBatch(entries: LedgerBatchEntry[]): Promise<void> {
+  if (entries.length === 0) {
+    return;
   }
 
   await store.transaction(async (tx) => {
