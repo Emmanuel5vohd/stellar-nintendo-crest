@@ -199,6 +199,8 @@ function toNonNegativeBigInt(value: unknown): bigint | null {
 
 export class EventRouter {
   private readonly handlers = new Map<string, EventHandler>();
+  private readonly batchQueues = new Map<string, BatchQueue>();
+  private broadcast: BroadcastHandler | null = null;
 
   constructor(
     private readonly onUnmapped: UnmappedHandler,
@@ -208,7 +210,7 @@ export class EventRouter {
 
   /** Registers the handler for one topic. A topic can have only one handler. */
   register(topic: string, handler: EventHandler): void {
-    if (this.handlers.has(topic)) {
+    if (this.handlers.has(topic) || this.batchQueues.has(topic)) {
       throw new Error(`handler already registered for topic ${topic}`);
     }
     this.handlers.set(topic, handler);
@@ -223,6 +225,12 @@ export class EventRouter {
    * swallowed so they never affect ingestion latency or correctness.
    */
   async dispatchContractEvent(event: RawContractEvent): Promise<boolean> {
+    this.publishBroadcast(event);
+    const batch = this.batchQueues.get(event.topic);
+    if (batch) {
+      this.enqueue(batch, event);
+      return true;
+    }
     const handler = this.handlers.get(event.topic);
     if (!handler) {
       this.onUnmapped(event);
@@ -253,6 +261,74 @@ export class EventRouter {
     } catch {
       // Telemetry is best-effort; never fail ingestion over it (#219).
     }
+  }
+
+  /**
+   * Flushes every buffered topic now. Callers should await this on shutdown so buffered events
+   * are not lost. A failed flush retains its events for the next attempt.
+   */
+  async flushAll(): Promise<void> {
+    await Promise.all([...this.batchQueues.values()].map((queue) => this.flush(queue)));
+  }
+
+  private publishBroadcast(event: RawContractEvent): void {
+    if (!this.broadcast) {
+      return;
+    }
+    if (!(BROADCAST_TOPICS as readonly string[]).includes(event.topic)) {
+      return;
+    }
+    try {
+      this.broadcast(event.topic as BroadcastTopic, event);
+    } catch {
+      // Broadcasting is best-effort; a failed publish must never break indexing.
+    }
+  }
+
+  private enqueue(queue: BatchQueue, event: RawContractEvent): void {
+    queue.buffer.push(event);
+    if (queue.buffer.length >= queue.maxBatchSize) {
+      void this.flush(queue);
+      return;
+    }
+    if (queue.timer === null) {
+      queue.timer = setTimeout(() => {
+        queue.timer = null;
+        void this.flush(queue);
+      }, queue.flushIntervalMs);
+      // Do not keep the process alive solely for a pending flush.
+      if (typeof queue.timer === "object" && queue.timer !== null && "unref" in queue.timer) {
+        (queue.timer as { unref: () => void }).unref();
+      }
+    }
+  }
+
+  private flush(queue: BatchQueue): Promise<void> {
+    if (queue.flushing) {
+      return queue.flushing;
+    }
+    if (queue.timer !== null) {
+      clearTimeout(queue.timer);
+      queue.timer = null;
+    }
+    if (queue.buffer.length === 0) {
+      return Promise.resolve();
+    }
+    const batch = queue.buffer.splice(0, queue.maxBatchSize);
+    queue.flushing = queue
+      .handler(batch)
+      .catch((error: unknown) => {
+        // Retain the events so a later flush retries them instead of dropping them (#210).
+        queue.buffer.unshift(...batch);
+        throw error;
+      })
+      .finally(() => {
+        queue.flushing = null;
+        if (queue.buffer.length > 0) {
+          this.enqueue(queue, queue.buffer.pop() as RawContractEvent);
+        }
+      });
+    return queue.flushing;
   }
 }
 

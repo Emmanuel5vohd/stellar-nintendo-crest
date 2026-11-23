@@ -9,6 +9,8 @@
  * installed yet. The shape is the same as a zod schema would describe.
  */
 
+import { Address, scValToNative, xdr } from "@stellar/stellar-sdk";
+
 export interface RawContractEvent {
   topic: string;
   contractId: string;
