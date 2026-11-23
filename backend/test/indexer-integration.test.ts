@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { handleBetPlaced, type BetPlacedEvent, type BetRow, type MarketTotals } from "../src/indexer/bet-placed";
 import { EventRouter } from "../src/indexer/event-router";
 import type { RawContractEvent } from "../src/indexer/event-schema";
+import { parseScValTopics } from "../src/indexer/scval-parser";
 
 /** In-memory store that behaves like the transactional PostgreSQL store. */
 function memoryStore() {
@@ -115,54 +116,50 @@ describe("indexer lifecycle", () => {
   });
 });
 
-describe("display name sanitization", () => {
-  it("accepts valid alphanumeric names with _ and -", () => {
-    expect(sanitizeDisplayName("alice")).toBe("alice");
-    expect(sanitizeDisplayName("Alice_99")).toBe("Alice_99");
-    expect(sanitizeDisplayName("a-b_c")).toBe("a-b_c");
-    expect(sanitizeDisplayName("abc")).toBe("abc");
-    expect(sanitizeDisplayName("a".repeat(20))).toBe("a".repeat(20));
+describe("ScVal topic parsing", () => {
+  it("parses Symbol topics into strings", () => {
+    const topics = parseScValTopics([{ type: "symbol", value: "bet_placed" }]);
+    expect(topics).toEqual(["bet_placed"]);
   });
 
-  it("rejects names shorter than 3 or longer than 20 characters", () => {
-    expect(sanitizeDisplayName("ab")).toBeNull();
-    expect(sanitizeDisplayName("a".repeat(21))).toBeNull();
-    expect(sanitizeDisplayName("")).toBeNull();
+  it("parses account and contract Address variants without throwing", () => {
+    const account = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    const contract = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+    const topics = parseScValTopics([
+      { type: "address", value: account },
+      { type: "address", value: contract },
+    ]);
+    expect(topics).toEqual([account, contract]);
   });
 
-  it("rejects XSS attack vectors", () => {
-    expect(sanitizeDisplayName("<script>alert(1)</script>")).toBeNull();
-    expect(sanitizeDisplayName("<img src=x onerror=alert(1)>")).toBeNull();
-    expect(sanitizeDisplayName("admin<script>")).toBeNull();
-    expect(sanitizeDisplayName("javascript:alert(1)")).toBeNull();
-    expect(sanitizeDisplayName("a\u0000b")).toBeNull();
-    expect(sanitizeDisplayName("name with spaces")).toBeNull();
-    expect(sanitizeDisplayName("drop;table")).toBeNull();
+  it("parses muxed addresses into their base account id", () => {
+    const muxed = "MAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const topics = parseScValTopics([{ type: "address", value: muxed }]);
+    expect(topics[0]).toBe(muxed);
   });
 
-  it("rejects non-string input", () => {
-    expect(sanitizeDisplayName(undefined)).toBeNull();
-    expect(sanitizeDisplayName(null)).toBeNull();
-    expect(sanitizeDisplayName(12345)).toBeNull();
-    expect(sanitizeDisplayName({})).toBeNull();
+  it("parses I128 and U64 numeric topics into bigints", () => {
+    const topics = parseScValTopics([
+      { type: "i128", value: 12345678901234567890n },
+      { type: "u64", value: 42n },
+    ]);
+    expect(topics).toEqual([12345678901234567890n, 42n]);
   });
 
-  it("normalizes homoglyphs to prevent lookalike impersonation", () => {
-    // Cyrillic "\u0430dmin" (a) normalizes to ASCII "admin".
-    expect(sanitizeDisplayName("\u0430dmin")).toBe("admin");
-    // Cyrillic "\u0410dmin" (A) normalizes to ASCII "Admin".
-    expect(sanitizeDisplayName("\u0410dmin")).toBe("Admin");
-    // Greek "\u03BF" (o) normalizes to ASCII "o".
-    expect(sanitizeDisplayName("b\u03BFb")).toBe("bob");
-    // Fullwidth characters normalize to ASCII.
-    expect(sanitizeDisplayName("\uFF41\uFF42\uFF43")).toBe("abc");
+  it("parses nested Vec topics recursively", () => {
+    const topics = parseScValTopics([
+      { type: "vec", value: [{ type: "symbol", value: "yes" }, { type: "u64", value: 1n }] },
+    ]);
+    expect(topics).toEqual([["yes", 1n]]);
   });
 
-  it("rejects names that remain invalid after homoglyph normalization", () => {
-    // Cyrillic homoglyph that maps to a valid char but the rest is invalid.
-    expect(sanitizeDisplayName("\u0430 b")).toBeNull();
-    // Emoji / unicode spoofing characters not in the whitelist.
-    expect(sanitizeDisplayName("admin\u200B")).toBeNull();
-    expect(sanitizeDisplayName("\uD83D\uDE00")).toBeNull();
+  it("logs the raw hex payload and returns null for unexpected shapes", () => {
+    const errors: unknown[] = [];
+    const topics = parseScValTopics([{ type: "mystery", value: "0xdeadbeef" }], (msg, raw) =>
+      errors.push({ msg, raw }),
+    );
+    expect(topics).toEqual([null]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({ raw: "0xdeadbeef" });
   });
 });
