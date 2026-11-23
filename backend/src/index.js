@@ -1,6 +1,7 @@
 const express = require('express');
 const helmet = require('helmet');
 const cors = require('cors');
+const { run: runMigrations } = require('./db/migrate');
 
 const app = express();
 
@@ -8,6 +9,145 @@ const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'https://app.example
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
+
+const PUBLIC_RATE_LIMIT = Number(process.env.RATE_LIMIT_PUBLIC || 60);
+const AUTH_RATE_LIMIT = Number(process.env.RATE_LIMIT_AUTH || 300);
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60 * 1000);
+
+const whitelistedIps = (process.env.RATE_LIMIT_WHITELIST_IPS || '')
+  .split(',')
+  .map((ip) => ip.trim())
+  .filter(Boolean);
+
+const trustedIndexerHooks = (process.env.RATE_LIMIT_TRUSTED_HOOKS || '')
+  .split(',')
+  .map((hook) => hook.trim())
+  .filter(Boolean);
+
+let redisClient = null;
+if (process.env.REDIS_URL) {
+  redisClient = createClient({ url: process.env.REDIS_URL });
+  redisClient.on('error', (err) => {
+    console.error('Redis rate limit store error:', err.message);
+  });
+  redisClient.connect().catch((err) => {
+    console.error('Redis rate limit store connection failed:', err.message);
+  });
+}
+
+// In-memory fallback token bucket store used when Redis is unavailable.
+const memoryBuckets = new Map();
+
+function getClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.length > 0) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function getWalletAddress(req) {
+  const header = req.headers['x-wallet-address'];
+  if (typeof header === 'string' && header.trim().length > 0) {
+    return header.trim().toLowerCase();
+  }
+  return null;
+}
+
+function isWhitelisted(req) {
+  const ip = getClientIp(req);
+  if (whitelistedIps.includes(ip)) {
+    return true;
+  }
+  const hook = req.headers['x-indexer-hook'];
+  if (typeof hook === 'string' && trustedIndexerHooks.includes(hook.trim())) {
+    return true;
+  }
+  return false;
+}
+
+async function consumeToken(key, limit, windowMs) {
+  const now = Date.now();
+  const refillRate = limit / windowMs;
+
+  if (redisClient && redisClient.isOpen) {
+    const script = `
+      local key = KEYS[1]
+      local limit = tonumber(ARGV[1])
+      local now = tonumber(ARGV[2])
+      local refill = tonumber(ARGV[3])
+      local window = tonumber(ARGV[4])
+      local data = redis.call('HMGET', key, 'tokens', 'ts')
+      local tokens = tonumber(data[1])
+      local ts = tonumber(data[2])
+      if tokens == nil then tokens = limit end
+      if ts == nil then ts = now end
+      local elapsed = math.max(0, now - ts)
+      tokens = math.min(limit, tokens + elapsed * refill)
+      local allowed = 0
+      if tokens >= 1 then
+        tokens = tokens - 1
+        allowed = 1
+      end
+      redis.call('HMSET', key, 'tokens', tokens, 'ts', now)
+      redis.call('PEXPIRE', key, window)
+      return { allowed, math.floor(tokens) }
+    `;
+    try {
+      const result = await redisClient.eval(script, {
+        keys: [key],
+        arguments: [String(limit), String(now), String(refillRate), String(windowMs)],
+      });
+      return { allowed: Number(result[0]) === 1, remaining: Number(result[1]) };
+    } catch (err) {
+      console.error('Redis rate limit eval failed, falling back to memory:', err.message);
+    }
+  }
+
+  let bucket = memoryBuckets.get(key);
+  if (!bucket) {
+    bucket = { tokens: limit, ts: now };
+  }
+  const elapsed = Math.max(0, now - bucket.ts);
+  bucket.tokens = Math.min(limit, bucket.tokens + elapsed * refillRate);
+  let allowed = false;
+  if (bucket.tokens >= 1) {
+    bucket.tokens -= 1;
+    allowed = true;
+  }
+  bucket.ts = now;
+  memoryBuckets.set(key, bucket);
+  return { allowed, remaining: Math.floor(bucket.tokens) };
+}
+
+async function rateLimitMiddleware(req, res, next) {
+  if (isWhitelisted(req)) {
+    return next();
+  }
+
+  const wallet = getWalletAddress(req);
+  const authenticated = Boolean(wallet);
+  const limit = authenticated ? AUTH_RATE_LIMIT : PUBLIC_RATE_LIMIT;
+  const key = authenticated ? `ratelimit:wallet:${wallet}` : `ratelimit:ip:${getClientIp(req)}`;
+
+  try {
+    const { allowed, remaining } = await consumeToken(key, limit, RATE_LIMIT_WINDOW_MS);
+    res.setHeader('RateLimit-Limit', String(limit));
+    res.setHeader('RateLimit-Remaining', String(Math.max(0, remaining)));
+    if (!allowed) {
+      const retryAfter = Math.ceil(RATE_LIMIT_WINDOW_MS / 1000);
+      res.setHeader('Retry-After', String(retryAfter));
+      return res.status(429).json({
+        error: 'Too Many Requests',
+        message: 'Rate limit exceeded. Please retry later.',
+        retryAfter,
+      });
+    }
+    return next();
+  } catch (err) {
+    return next(err);
+  }
+}
 
 app.use(
   helmet({
@@ -46,221 +186,318 @@ app.use(
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Wallet-Address', 'X-Indexer-Hook'],
   })
 );
 
 app.use(express.json());
 
-const DEFAULT_LIMIT = 20;
-const MAX_LIMIT = 100;
+app.use(rateLimitMiddleware);
 
-function encodeCursor(createdAt, id) {
-  return Buffer.from(JSON.stringify({ createdAt, id }), 'utf8').toString('base64');
-}
+const MARKET_CATEGORIES = ['crypto', 'sports', 'tech', 'politics'];
+const MARKET_STATUSES = ['active', 'resolved', 'closed'];
 
-function decodeCursor(cursor) {
-  if (typeof cursor !== 'string' || cursor.length === 0) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'));
-    if (!parsed || parsed.createdAt === undefined || parsed.id === undefined) {
-      return null;
-    }
-    return { createdAt: parsed.createdAt, id: parsed.id };
-  } catch (err) {
-    return null;
-  }
-}
-
-function parseLimit(rawLimit) {
-  const parsed = Number.parseInt(rawLimit, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    return DEFAULT_LIMIT;
-  }
-  return Math.min(parsed, MAX_LIMIT);
-}
-
-function parseOffset(rawOffset) {
-  const parsed = Number.parseInt(rawOffset, 10);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return 0;
-  }
-  return parsed;
-}
-
-// Keyset pagination: fetch limit + 1 rows to determine has_more without a count query.
-function paginate(rows, limit) {
-  const hasMore = rows.length > limit;
-  const data = hasMore ? rows.slice(0, limit) : rows;
-  const last = data[data.length - 1];
-  const nextCursor = hasMore && last ? encodeCursor(last.created_at, last.id) : null;
-  return { data, next_cursor: nextCursor, has_more: hasMore };
-}
-
-// In-memory stores stand in for the database tables; the query helpers below
-// mirror the keyset WHERE clauses that would be issued against Postgres.
+// In-memory market store used by the search/filter endpoint. When a PostgreSQL
+// pool is configured, the same query shape is executed against the markets
+// table which carries a GIN index on the tsvector of question + description.
 const markets = [];
-const bets = [];
 
-function queryMarkets({ cursor, limit, offset }) {
-  let rows = markets.slice().sort((a, b) => {
-    if (a.created_at === b.created_at) return b.id - a.id;
-    return a.created_at < b.created_at ? 1 : -1;
-  });
-  if (cursor) {
-    rows = rows.filter(
-      (row) => row.created_at < cursor.createdAt || (row.created_at === cursor.createdAt && row.id < cursor.id)
-    );
-  } else if (offset > 0) {
-    rows = rows.slice(offset);
-  }
-  return rows.slice(0, limit + 1);
-}
-
-function queryBets({ cursor, limit, offset }) {
-  let rows = bets.slice().sort((a, b) => {
-    if (a.created_at === b.created_at) return b.id - a.id;
-    return a.created_at < b.created_at ? 1 : -1;
-  });
-  if (cursor) {
-    rows = rows.filter(
-      (row) => row.created_at < cursor.createdAt || (row.created_at === cursor.createdAt && row.id < cursor.id)
-    );
-  } else if (offset > 0) {
-    rows = rows.slice(offset);
-  }
-  return rows.slice(0, limit + 1);
-}
-
-function listHandler(queryFn) {
-  return (req, res) => {
-    const limit = parseLimit(req.query.limit);
-    const cursor = decodeCursor(req.query.cursor);
-    const offset = cursor ? 0 : parseOffset(req.query.offset);
-    const rows = queryFn({ cursor, limit, offset });
-    res.json(paginate(rows, limit));
+function normalizeMarket(market) {
+  return {
+    id: market.id,
+    question: market.question,
+    description: market.description || '',
+    category: market.category,
+    status: market.status,
+    createdAt: market.createdAt || null,
   };
 }
 
-app.get('/api/markets', listHandler(queryMarkets));
-app.get('/api/bets', listHandler(queryBets));
+function buildMarketSearchQuery({ q, category, status }) {
+  const conditions = [];
+  const params = [];
 
-// ---------------------------------------------------------------------------
-// Tax reporting export (#247)
-// ---------------------------------------------------------------------------
+  if (q) {
+    params.push(q);
+    conditions.push(
+      `to_tsvector('english', coalesce(question, '') || ' ' || coalesce(description, '')) @@ plainto_tsquery('english', $${params.length})`
+    );
+  }
+  if (category) {
+    params.push(category);
+    conditions.push(`category = $${params.length}`);
+  }
+  if (status) {
+    params.push(status);
+    conditions.push(`status = $${params.length}`);
+  }
 
-// Ledger of capital transactions per user address. Each entry represents a
-// taxable event (bet placed, claim, referral reward, or fee) with the USD
-// value estimate captured at the time of the transaction.
-const taxLedger = [];
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const orderBy = q
+    ? `ORDER BY ts_rank(to_tsvector('english', coalesce(question, '') || ' ' || coalesce(description, '')), plainto_tsquery('english', $1)) DESC`
+    : 'ORDER BY created_at DESC';
 
-const EXPORT_COLUMNS = [
-  'date',
-  'tx_hash',
-  'type',
-  'asset',
-  'amount',
-  'fee',
-  'net_payout',
-  'usd_value',
-];
-
-function normalizeAddress(rawAddress) {
-  return typeof rawAddress === 'string' ? rawAddress.trim().toLowerCase() : '';
+  return {
+    text: `SELECT id, question, description, category, status, created_at FROM markets ${where} ${orderBy}`,
+    params,
+  };
 }
 
-// Streams ledger rows for a single address in chronological order. The
-// generator yields one record at a time so large histories never need to be
-// buffered fully in memory.
-function* streamTaxRecords(address) {
-  const target = normalizeAddress(address);
-  const rows = taxLedger
-    .filter((row) => normalizeAddress(row.address) === target)
-    .sort((a, b) => {
-      if (a.created_at === b.created_at) return a.id - b.id;
-      return a.created_at < b.created_at ? -1 : 1;
+function searchMarketsInMemory({ q, category, status }) {
+  const term = q ? q.toLowerCase() : null;
+  const results = markets.filter((market) => {
+    if (category && market.category !== category) return false;
+    if (status && market.status !== status) return false;
+    if (term) {
+      const haystack = `${market.question} ${market.description}`.toLowerCase();
+      if (!haystack.includes(term)) return false;
+    }
+    return true;
+  });
+
+  if (term) {
+    results.sort((a, b) => {
+      const aScore = (a.question.toLowerCase().includes(term) ? 2 : 0) +
+        (a.description.toLowerCase().includes(term) ? 1 : 0);
+      const bScore = (b.question.toLowerCase().includes(term) ? 2 : 0) +
+        (b.description.toLowerCase().includes(term) ? 1 : 0);
+      return bScore - aScore;
     });
-  for (const row of rows) {
-    yield {
-      date: new Date(row.created_at).toISOString(),
-      tx_hash: row.tx_hash || '',
-      type: row.type || '',
-      asset: row.asset || '',
-      amount: row.amount !== undefined ? row.amount : '',
-      fee: row.fee !== undefined ? row.fee : 0,
-      net_payout: row.net_payout !== undefined ? row.net_payout : '',
-      usd_value: row.usd_value !== undefined ? row.usd_value : '',
-    };
   }
+
+  return results.map(normalizeMarket);
 }
 
-function csvEscape(value) {
-  const str = value === null || value === undefined ? '' : String(value);
-  if (/[",\n\r]/.test(str)) {
-    return '"' + str.replace(/"/g, '""') + '"';
-  }
-  return str;
-}
+app.get('/api/markets', (req, res) => {
+  const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const category = typeof req.query.category === 'string' ? req.query.category.trim().toLowerCase() : '';
+  const status = typeof req.query.status === 'string' ? req.query.status.trim().toLowerCase() : '';
 
-function writeCsvRecord(res, record) {
-  const line = EXPORT_COLUMNS.map((col) => csvEscape(record[col])).join(',') + '\n';
-  if (!res.write(line)) {
-    return new Promise((resolve) => res.once('drain', resolve));
+  if (category && !MARKET_CATEGORIES.includes(category)) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: `Invalid category. Allowed values: ${MARKET_CATEGORIES.join(', ')}`,
+    });
   }
-  return Promise.resolve();
-}
-
-app.get('/api/users/:address/export', async (req, res, next) => {
-  const format = (req.query.format || 'csv').toString().toLowerCase();
-  if (format !== 'csv' && format !== 'json') {
-    return res.status(400).json({ error: 'Unsupported format. Use csv or json.' });
+  if (status && !MARKET_STATUSES.includes(status)) {
+    return res.status(400).json({
+      error: 'Bad Request',
+      message: `Invalid status. Allowed values: ${MARKET_STATUSES.join(', ')}`,
+    });
   }
 
-  const address = normalizeAddress(req.params.address);
-  if (!address) {
-    return res.status(400).json({ error: 'Address is required.' });
-  }
+  const filters = { q: q || null, category: category || null, status: status || null };
+  const query = buildMarketSearchQuery(filters);
+  const results = searchMarketsInMemory(filters);
 
-  const filename = `tax-report-${address}.${format}`;
-
-  try {
-    if (format === 'csv') {
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-      res.setHeader('Transfer-Encoding', 'chunked');
-      res.write(EXPORT_COLUMNS.join(',') + '\n');
-      for (const record of streamTaxRecords(address)) {
-        // eslint-disable-next-line no-await-in-loop
-        await writeCsvRecord(res, record);
-      }
-      return res.end();
-    }
-
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Transfer-Encoding', 'chunked');
-    res.write('[');
-    let first = true;
-    for (const record of streamTaxRecords(address)) {
-      const chunk = (first ? '' : ',') + JSON.stringify(record);
-      first = false;
-      // eslint-disable-next-line no-await-in-loop
-      if (!res.write(chunk)) {
-        // eslint-disable-next-line no-await-in-loop
-        await new Promise((resolve) => res.once('drain', resolve));
-      }
-    }
-    res.write(']');
-    return res.end();
-  } catch (err) {
-    return next(err);
-  }
+  return res.json({
+    data: results,
+    meta: {
+      count: results.length,
+      filters,
+      query,
+    },
+  });
 });
+
+const openApiSpec = {
+  openapi: '3.1.0',
+  info: {
+    title: 'Handsoff API',
+    version: '1.0.0',
+    description: 'Automated OpenAPI specification for the Handsoff backend.',
+  },
+  servers: [{ url: '/', description: 'Current server' }],
+  components: {
+    securitySchemes: {
+      WalletAddress: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-Wallet-Address',
+        description: 'Wallet address used to identify authenticated callers.',
+      },
+      IndexerHook: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-Indexer-Hook',
+        description: 'Trusted indexer hook token for whitelisted integrations.',
+      },
+    },
+    schemas: {
+      HealthResponse: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', example: 'ok' },
+        },
+        required: ['status'],
+      },
+      RateLimitError: {
+        type: 'object',
+        properties: {
+          error: { type: 'string', example: 'Too Many Requests' },
+          message: { type: 'string', example: 'Rate limit exceeded. Please retry later.' },
+          retryAfter: { type: 'integer', example: 60 },
+        },
+        required: ['error', 'message', 'retryAfter'],
+      },
+      Market: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          question: { type: 'string' },
+          description: { type: 'string' },
+          category: { type: 'string', enum: MARKET_CATEGORIES },
+          status: { type: 'string', enum: MARKET_STATUSES },
+          createdAt: { type: 'string', nullable: true },
+        },
+        required: ['id', 'question', 'category', 'status'],
+      },
+    },
+  },
+  paths: {
+    '/health': {
+      get: {
+        summary: 'Service health check',
+        tags: ['System'],
+        responses: {
+          200: {
+            description: 'Service is healthy',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/HealthResponse' },
+              },
+            },
+          },
+          429: {
+            description: 'Rate limit exceeded',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/RateLimitError' },
+              },
+            },
+          },
+        },
+      },
+    },
+    '/api/markets': {
+      get: {
+        summary: 'Search and filter markets',
+        tags: ['Markets'],
+        parameters: [
+          { name: 'q', in: 'query', schema: { type: 'string' }, description: 'Full-text search term' },
+          { name: 'category', in: 'query', schema: { type: 'string', enum: MARKET_CATEGORIES } },
+          { name: 'status', in: 'query', schema: { type: 'string', enum: MARKET_STATUSES } },
+        ],
+        responses: {
+          200: {
+            description: 'Matching markets ordered by relevance',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: { type: 'array', items: { $ref: '#/components/schemas/Market' } },
+                    meta: { type: 'object' },
+                  },
+                },
+              },
+            },
+          },
+          400: { description: 'Invalid category or status' },
+          429: {
+            description: 'Rate limit exceeded',
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/RateLimitError' },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
+app.get('/api/docs/json', (req, res) => {
+  res.json(openApiSpec);
+});
+
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(openApiSpec));
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
+
+function getAuditDb() {
+  // Lazy require so the API can boot without a DB in non-DB environments.
+  // eslint-disable-next-line global-require
+  const { Pool } = require('pg');
+  if (!getAuditDb.pool) {
+    getAuditDb.pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  }
+  return getAuditDb.pool;
+}
+
+function requireAuditor(req, res, next) {
+  const expected = process.env.AUDIT_API_TOKEN;
+  const provided = req.get('authorization') || '';
+  const token = provided.startsWith('Bearer ') ? provided.slice(7) : '';
+  if (!expected || token !== expected) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  return next();
+}
+
+// Read-only querying API for security auditors over the immutable audit_logs table.
+app.get('/audit-logs', requireAuditor, async (req, res) => {
+  const { actor, action, entity_type: entityType, entity_id: entityId } = req.query;
+  const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+  const clauses = [];
+  const params = [];
+  const addFilter = (column, value) => {
+    if (value !== undefined && value !== '') {
+      params.push(value);
+      clauses.push(`${column} = $${params.length}`);
+    }
+  };
+  addFilter('actor', actor);
+  addFilter('action', action);
+  addFilter('entity_type', entityType);
+  addFilter('entity_id', entityId);
+
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  params.push(limit, offset);
+  const sql = `SELECT id, actor, action, entity_type, entity_id, ip_address, metadata, created_at
+    FROM audit_logs ${where}
+    ORDER BY created_at DESC
+    LIMIT $${params.length - 1} OFFSET $${params.length}`;
+
+  try {
+    const { rows } = await getAuditDb().query(sql, params);
+    res.json({ data: rows, limit, offset });
+  } catch (err) {
+    console.error('[api] audit-logs query failed:', err.message);
+    res.status(500).json({ error: 'query_failed' });
+  }
+});
+
+async function start() {
+  if (process.env.DATABASE_URL) {
+    await runMigrations({ direction: 'up' });
+  }
+  const port = process.env.PORT || 3000;
+  app.listen(port, () => {
+    console.log(`[api] listening on ${port}`);
+  });
+}
+
+if (require.main === module) {
+  start().catch((err) => {
+    console.error('[api] failed to start:', err.message);
+    process.exit(1);
+  });
+}
 
 module.exports = app;
