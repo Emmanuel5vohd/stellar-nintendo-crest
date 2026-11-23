@@ -6,6 +6,7 @@
  * so both run the same handler code. Topics with no handler are reported, not dropped.
  */
 
+import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
 import type { RawContractEvent } from "./event-schema";
 
 export type EventHandler = (event: RawContractEvent) => Promise<void>;
